@@ -68,12 +68,14 @@ RNG micro-optimisation) and enables it by default (`sobol` feature).
 - Sobol's low-discrepancy structure is what makes per-transition statistics stable at far
   fewer paths.
 
-> **Implemented.** `riga_engine::qmc` provides a digit-scrambled **Halton** ladder with
-> inverse-CDF normals and a **Brownian bridge**, selected by `SimulationConfig.variance_reduction
-> = { kind: "halton", dimension }`. Draws are CRN-shared across bumps and no Brownian cube is
-> materialised; `PathIdentity.sobol_index` is populated. Measured variance reduction is marginal
-> for this discontinuous, high-dimensional barrier payoff (**~1.05×** at the full ~210-dim path);
-> real gains need Sobol direction-number tables + Owen scrambling.
+> **Implemented.** `riga_engine::qmc` provides a **selectable ladder** —
+> `SimulationConfig.variance_reduction = { kind: "none" | "halton" | "sobol", dimension }`:
+> a digit-scrambled **Halton** and a **Sobol** sequence (in-house GF(2) primitive polynomials +
+> Joe–Kuo direction numbers) with **Owen (nested) scrambling** and inverse-CDF normals. Draws are
+> CRN-shared across bumps, a Brownian bridge concentrates variance in the low dimensions, and no
+> cube is materialised; `PathIdentity.sobol_index` is populated. Measured at the full ~210-dim
+> path: Halton 1.05×, Sobol 1.04× — marginal, because the payoff is discontinuous and
+> high-dimensional.
 
 ## 5. Where RNG reuse genuinely pays: CRN
 

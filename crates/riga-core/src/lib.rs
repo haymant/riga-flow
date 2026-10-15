@@ -98,6 +98,11 @@ pub enum VarianceReduction {
         /// Number of QMC dimensions (= steps × factors).
         dimension: usize,
     },
+    /// Low-discrepancy QMC: Sobol sequence with Owen scrambling (better in high dimension).
+    Sobol {
+        /// Number of QMC dimensions (= steps × factors).
+        dimension: usize,
+    },
 }
 
 impl Default for SimulationConfig {

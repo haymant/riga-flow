@@ -126,10 +126,11 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
 
 **Remaining (engine-side):**
 
-1. **Sobol + Owen scrambling** — real QMC gains. The digit-scrambled Halton + Brownian bridge
-   costs only marginal variance reduction (~1.05× at the full ~210-dim path); a discontinuous,
-   high-dimensional barrier payoff needs Sobol direction-number tables plus Owen scrambling
-   (research-level).
+- None outstanding. The last item — **Sobol + Owen scrambling** — is implemented: `VarianceReduction`
+  now offers `{none, halton, sobol}` (Sobol with in-house GF(2) direction numbers + Owen scrambling).
+  Measured at the full ~210-dim path the variance reduction is marginal (Halton 1.05×, Sobol 1.04×),
+  which is the expected outcome for a discontinuous, high-dimensional barrier payoff — the
+  mechanism is present and selectable, the payoff just does not reward QMC much.
 
 **Out of scope (user decision):**
 

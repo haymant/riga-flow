@@ -658,37 +658,32 @@ mod tests {
             let mean = values.iter().sum::<f64>() / values.len() as f64;
             values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() as f64 - 1.0)
         };
-        let measure = |steps: usize| {
-            let (mut mc, mut qmc) = (Vec::new(), Vec::new());
+        let measure = |vr: VarianceReduction| {
+            let mut samples = Vec::new();
             for seed in 1..=12u64 {
                 let mut request = base.clone();
-                request.trade.steps = steps;
                 request.config.paths = 4096;
                 request.config.path_block_size = 4096;
                 request.config.seed = seed;
-                request.config.variance_reduction = VarianceReduction::None;
-                mc.push(price_put_leg(&request).unwrap().legs.down_and_in_put);
-                request.config.variance_reduction = VarianceReduction::Halton {
-                    dimension: steps * 2,
-                };
-                qmc.push(price_put_leg(&request).unwrap().legs.down_and_in_put);
+                request.config.variance_reduction = vr.clone();
+                samples.push(price_put_leg(&request).unwrap().legs.down_and_in_put);
             }
-            (variance(&mc), variance(&qmc))
+            variance(&samples)
         };
 
-        let (mc_low, qmc_low) = measure(16);
+        let dim = base.trade.steps * 2;
+        let mc = measure(VarianceReduction::None);
+        let halton = measure(VarianceReduction::Halton { dimension: dim });
+        let sobol = measure(VarianceReduction::Sobol { dimension: dim });
         eprintln!(
-            "QMC (dim 32): MC {mc_low:.3e} -> QMC {qmc_low:.3e} ({:.2}x)",
-            mc_low / qmc_low
+            "variance @ 4096 paths, full dim {dim}: MC {mc:.3e} | Halton {halton:.3e} ({:.2}x) | Sobol {sobol:.3e} ({:.2}x)",
+            mc / halton,
+            mc / sobol
         );
-
-        let (mc_full, qmc_full) = measure(base.trade.steps);
-        eprintln!(
-            "QMC (full path dim {}, + Brownian bridge): MC {mc_full:.3e} -> QMC {qmc_full:.3e} ({:.2}x)",
-            base.trade.steps * 2,
-            mc_full / qmc_full
+        assert!(sobol > 0.0 && sobol.is_finite());
+        assert!(
+            mc / sobol > 1.0,
+            "Sobol+Owen should reduce the high-dimensional estimator variance (MC {mc:.3e}, Sobol {sobol:.3e})"
         );
-        // Evidence only: QMC gains for this discontinuous, high-dimensional barrier payoff are
-        // marginal; meaningful reduction needs Sobol + Owen scrambling (see the gap matrix).
     }
 }

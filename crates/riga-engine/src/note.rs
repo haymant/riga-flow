@@ -56,12 +56,7 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
     let mut trace_events: Vec<String> = Vec::new();
     const TRACE_EVENT_CAP: usize = 64;
     let mut rng = ChaCha8Rng::seed_from_u64(request.config.seed);
-    let qmc = match &request.config.variance_reduction {
-        riga_core::VarianceReduction::Halton { dimension } => {
-            Some(crate::qmc::Halton::new(*dimension, request.config.seed))
-        }
-        riga_core::VarianceReduction::None => None,
-    };
+    let qmc = crate::qmc::ladder_for(&request.config.variance_reduction, request.config.seed);
     let mut qmc_normals: Option<[Vec<f64>; 2]> =
         qmc.as_ref().map(|_| [vec![0.0; steps], vec![0.0; steps]]);
     let mut qmc_increments: Option<[Vec<f64>; 2]> =
