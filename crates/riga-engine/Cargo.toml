@@ -23,3 +23,4 @@ gpu = ["dep:cudarc"]
 simd = []
 
 [dev-dependencies]
+riga-scheduler = { path = "../riga-scheduler" }

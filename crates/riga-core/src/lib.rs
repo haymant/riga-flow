@@ -243,6 +243,9 @@ pub struct PriceResult {
     pub legs: LegAttribution,
     pub stats: Vec<TransitionStats>,
     pub ledger: Vec<LedgerEntry>,
+    /// Sampled execution events (empty, and not serialized, at `TraceLevel::Off`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace_events: Vec<String>,
     pub determinism: DeterminismEnvelope,
 }
 

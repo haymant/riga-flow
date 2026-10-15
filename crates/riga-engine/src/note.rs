@@ -3,7 +3,8 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 use riga_core::{
-    DeterminismEnvelope, LedgerEntry, LegAttribution, PriceResult, RigaError, TransitionStats,
+    DeterminismEnvelope, LedgerEntry, LegAttribution, PriceResult, RigaError, TraceLevel,
+    TransitionStats,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -50,6 +51,10 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
     let call_barrier = request.trade.knock_out_barrier.unwrap_or(f64::INFINITY);
     let coupon_barrier = request.trade.coupon_barrier.unwrap_or(f64::INFINITY);
     let coupon_rate = request.trade.coupon_rate.unwrap_or(0.0);
+    // Trace gating on the hot loop: `TraceLevel::Off` records nothing (no allocation).
+    let trace_level = request.config.trace_level;
+    let mut trace_events: Vec<String> = Vec::new();
+    const TRACE_EVENT_CAP: usize = 64;
     let mut rng = ChaCha8Rng::seed_from_u64(request.config.seed);
     let qmc = match &request.config.variance_reduction {
         riga_core::VarianceReduction::Halton { dimension } => {
@@ -171,6 +176,13 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
                     knocked_out = true;
                     redemption_time = time;
                     ko_count += 1;
+                    if !matches!(trace_level, TraceLevel::Off)
+                        && trace_events.len() < TRACE_EVENT_CAP
+                    {
+                        trace_events.push(format!(
+                            "daily_global_ko:path={path_id}:t={redemption_time:.6}"
+                        ));
+                    }
                     let due = if period == 0 && request.trade.fixed_first_coupon {
                         coupon_rate
                     } else {
@@ -358,6 +370,7 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             discounting: 0.0,
             total,
         },
+        trace_events,
         stats,
         ledger,
         determinism,

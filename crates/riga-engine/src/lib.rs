@@ -173,6 +173,7 @@ fn price_terminal_put(request: &PriceRequest) -> Result<PriceResult, RigaError> 
         },
         stats,
         ledger,
+        trace_events: Vec::new(),
         determinism,
     })
 }
@@ -630,6 +631,21 @@ mod tests {
     fn cpu_build_has_no_gpu_backend_and_is_portable() {
         assert!(!gpu_enabled());
         assert!(gpu_backend().is_ok());
+    }
+
+    #[test]
+    fn trace_off_records_no_events_and_sampled_records_some() {
+        use riga_core::TraceLevel;
+        let base = fixture().request;
+        let mut off = base.clone();
+        off.config.trace_level = TraceLevel::Off;
+        assert!(price_put_leg(&off).unwrap().trace_events.is_empty());
+        let mut sampled = base.clone();
+        sampled.config.trace_level = TraceLevel::Sampled;
+        assert!(
+            !price_put_leg(&sampled).unwrap().trace_events.is_empty(),
+            "sampled tracing should record KO events"
+        );
     }
 
     #[test]

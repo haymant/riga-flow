@@ -1,0 +1,50 @@
+name: release
+
+# Publish riga-flow's headless binaries to a GitHub Release. Mirrors the parent
+# repository's tag-triggered release flow: nothing is built or published until a
+# version tag is pushed (or the workflow is dispatched manually).
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    name: Build + publish (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked -p riga-cli -p riga-mcp
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/riga target/release/riga-mcp dist/
+          tar -C dist -czf "riga-flow-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" riga riga-mcp
+          ls -l dist
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: riga-flow-*.tar.gz
+          generate_release_notes: true

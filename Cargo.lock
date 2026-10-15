@@ -777,6 +777,7 @@ dependencies = [
  "rand_distr",
  "riga-core",
  "riga-market",
+ "riga-scheduler",
  "serde",
  "serde_json",
  "sha2",
