@@ -19,18 +19,10 @@ pub fn worst_of_two_scalar(a: &[f32], b: &[f32], out: &mut [f32]) {
     }
 }
 
-/// Vectorised worst-of over two performance slices.
-///
-/// Bit-identical to [`worst_of_two_scalar`] for finite inputs.
+/// SSE2 worst-of (4 lanes).
 #[cfg(target_arch = "x86_64")]
-pub fn worst_of_two(a: &[f32], b: &[f32], out: &mut [f32]) {
+fn worst_of_two_sse2(a: &[f32], b: &[f32], out: &mut [f32]) {
     use core::arch::x86_64::{_mm_loadu_ps, _mm_min_ps, _mm_storeu_ps};
-    assert_eq!(a.len(), b.len(), "worst-of inputs must be the same length");
-    assert_eq!(
-        a.len(),
-        out.len(),
-        "worst-of output must match input length"
-    );
     let n = a.len();
     let mut i = 0;
     // SAFETY: the loop guards `i + 4 <= n`; pointers stay in bounds.
@@ -44,6 +36,47 @@ pub fn worst_of_two(a: &[f32], b: &[f32], out: &mut [f32]) {
     }
     for j in i..n {
         out[j] = a[j].min(b[j]);
+    }
+}
+
+/// AVX2 worst-of (8 lanes).
+///
+/// # Safety
+/// Caller must ensure `is_x86_feature_detected!("avx2")` is true on this CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn worst_of_two_avx2(a: &[f32], b: &[f32], out: &mut [f32]) {
+    use core::arch::x86_64::{_mm256_loadu_ps, _mm256_min_ps, _mm256_storeu_ps};
+    let n = a.len();
+    let mut i = 0;
+    while i + 8 <= n {
+        let va = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+        let vb = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_min_ps(va, vb)) };
+        i += 8;
+    }
+    for j in i..n {
+        out[j] = a[j].min(b[j]);
+    }
+}
+
+/// Vectorised worst-of over two performance slices.
+///
+/// Bit-identical to [`worst_of_two_scalar`] for finite inputs. Picks AVX2 when the CPU
+/// supports it, else SSE2.
+#[cfg(target_arch = "x86_64")]
+pub fn worst_of_two(a: &[f32], b: &[f32], out: &mut [f32]) {
+    assert_eq!(a.len(), b.len(), "worst-of inputs must be the same length");
+    assert_eq!(
+        a.len(),
+        out.len(),
+        "worst-of output must match input length"
+    );
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: guarded by runtime feature detection.
+        unsafe { worst_of_two_avx2(a, b, out) };
+    } else {
+        worst_of_two_sse2(a, b, out);
     }
 }
 

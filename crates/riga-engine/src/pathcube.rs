@@ -14,6 +14,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 use riga_core::RigaError;
 use riga_market::Cholesky;
+use serde::{Deserialize, Serialize};
 
 /// A correlated standard-normal block `[path, time, factor]`, row-major.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,7 +76,7 @@ pub fn generate_correlated_block(
 }
 
 /// An evolved spot PathCube `[path, time, factor]`, row-major, in `f32`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathCube {
     pub paths: usize,
     pub times: usize,
@@ -84,6 +85,17 @@ pub struct PathCube {
 }
 
 impl PathCube {
+    /// Persist the cube to a JSON archive (Phase 11 persistent PathCube archive).
+    pub fn write_archive(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, bytes)
+    }
+
+    /// Read a cube back from a JSON archive.
+    pub fn read_archive(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+    }
     #[inline]
     pub fn index(&self, path: usize, time: usize, factor: usize) -> usize {
         (path * self.times + time) * self.factors + factor
@@ -234,5 +246,21 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "shape_mismatch");
+    }
+
+    #[test]
+    fn pathcube_archive_round_trips() {
+        let chol = CorrelationMatrix::from_rows(&[vec![1.0, 0.2], vec![0.2, 1.0]])
+            .unwrap()
+            .cholesky()
+            .unwrap();
+        let block = generate_correlated_block(3, 8, 4, &chol);
+        let cube =
+            gbm_evolve(&[100.0, 50.0], &[0.2, 0.3], 0.03, &[0.0, 0.0], 0.01, &block).unwrap();
+        let path = std::env::temp_dir().join(format!("riga_pathcube_{}.json", std::process::id()));
+        cube.write_archive(&path).unwrap();
+        let restored = PathCube::read_archive(&path).unwrap();
+        assert_eq!(cube, restored);
+        let _ = std::fs::remove_file(&path);
     }
 }

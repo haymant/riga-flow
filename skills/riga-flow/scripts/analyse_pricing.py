@@ -19,6 +19,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 BIN = os.path.join(ROOT, "target", "release", "riga-mcp")
@@ -26,20 +27,31 @@ DEFAULT_FIXTURE = "docs/fixture/termsheet1.json"
 
 
 def mcp(calls):
-    msgs = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                    "clientInfo": {"name": "analyse", "version": "0"}}},
-        {"jsonrpc": "2.0", "method": "notifications/initialized"},
-    ]
+    # Keep stdin open until every response arrives: closing it early cancels
+    # slow tool calls (e.g. the 13-scenario risk batch).
+    proc = subprocess.Popen(
+        [BIN, "--transport", "stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, bufsize=1,
+    )
+
+    def send(message):
+        proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+
+    send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+          "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                     "clientInfo": {"name": "analyse", "version": "0"}}})
+    send({"jsonrpc": "2.0", "method": "notifications/initialized"})
     for i, (name, args) in enumerate(calls, start=2):
-        msgs.append({"jsonrpc": "2.0", "id": i, "method": "tools/call",
-                     "params": {"name": name, "arguments": args}})
-    payload = "".join(json.dumps(m) + "\n" for m in msgs).encode()
-    proc = subprocess.run([BIN, "--transport", "stdio"], input=payload,
-                          capture_output=True, timeout=300)
+        send({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+              "params": {"name": name, "arguments": args}})
+
     out = {}
-    for line in proc.stdout.decode().splitlines():
+    deadline = time.time() + 300
+    while len(out) < len(calls) and time.time() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            break
         try:
             message = json.loads(line)
         except Exception:
@@ -47,9 +59,11 @@ def mcp(calls):
         if message.get("id", 0) >= 2:
             result = message.get("result") or {}
             out[calls[message["id"] - 2][0]] = result.get("structuredContent")
+    proc.stdin.close()
+    proc.terminate()
     missing = [n for n, _ in calls if out.get(n) is None]
     if missing:
-        sys.exit(f"no structured result from: {', '.join(missing)}\n{proc.stderr.decode()[:400]}")
+        sys.exit(f"no structured result from: {', '.join(missing)}")
     return out
 
 

@@ -185,6 +185,71 @@ pub fn price_central_greeks(
     })
 }
 
+/// A Monte-Carlo convergence estimate of a FD Greek: the replicated mean and its
+/// standard error, so a Greek can be quoted with a confidence band.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConvergenceEstimate {
+    /// Mean FD estimate across replicates.
+    pub value: f64,
+    /// Standard error of the mean across replicates.
+    pub standard_error: f64,
+    /// Number of independent replicates (each internally CRN-paired).
+    pub replicates: usize,
+}
+
+impl ConvergenceEstimate {
+    /// A symmetric 95% band (`1.96 · SE`).
+    pub fn band_95(&self) -> f64 {
+        1.96 * self.standard_error
+    }
+}
+
+/// Estimate the FD spot delta of asset 0 with an independent-replicate standard error.
+///
+/// Each replicate uses CRN internally (one seed for the up and down valuations) so the
+/// per-replicate difference is low-variance; replicate seeds are independent, giving an
+/// unbiased standard error of the delta estimate (Phase 5 convergence evidence).
+pub fn crn_delta_convergence(
+    request: &PriceRequest,
+    config: &CentralDifferenceConfig,
+    replicates: usize,
+) -> Result<ConvergenceEstimate, RigaError> {
+    validate_configuration(request, config)?;
+    if replicates == 0 {
+        return Err(RigaError::new(
+            "invalid_replicates",
+            "replicates must be greater than zero",
+        ));
+    }
+    let asset = 0usize;
+    let h = request.market.spots[asset] * config.spot_relative_bump;
+    let mut samples = Vec::with_capacity(replicates);
+    for replicate in 0..replicates as u64 {
+        // One seed per replicate ⇒ CRN within the pair, independence across replicates.
+        let seed = 1_000_000 + replicate;
+        let mut up = request.clone();
+        up.market.spots[asset] += h;
+        up.config.seed = seed;
+        let mut down = request.clone();
+        down.market.spots[asset] -= h;
+        down.config.seed = seed;
+        let delta = (price_put_leg(&up)?.pv - price_put_leg(&down)?.pv) / (2.0 * h);
+        samples.push(delta);
+    }
+    let n = replicates as f64;
+    let mean = samples.iter().sum::<f64>() / n;
+    let variance = if replicates > 1 {
+        samples.iter().map(|s| (s - mean) * (s - mean)).sum::<f64>() / (n - 1.0)
+    } else {
+        0.0
+    };
+    Ok(ConvergenceEstimate {
+        value: mean,
+        standard_error: (variance / n).sqrt(),
+        replicates,
+    })
+}
+
 fn price_with_common_seed(request: &PriceRequest, seed: u64) -> Result<PriceResult, RigaError> {
     let mut scenario = request.clone();
     // Keep the stream identity explicit even if callers later introduce scenario construction.
@@ -789,6 +854,28 @@ mod tests {
         assert_eq!(
             price_central_greeks(&request, &config).unwrap_err().code,
             "invalid_correlation_bump"
+        );
+    }
+
+    #[test]
+    fn crn_delta_convergence_standard_error_shrinks_with_replicates() {
+        let request = small_termsheet_request();
+        let config = CentralDifferenceConfig::default();
+        let coarse = crn_delta_convergence(&request, &config, 16).unwrap();
+        let fine = crn_delta_convergence(&request, &config, 64).unwrap();
+        eprintln!(
+            "delta: 16 reps {:.6} +/- {:.2e} (95% band {:.2e}); 64 reps {:.6} +/- {:.2e} (95% band {:.2e})",
+            coarse.value,
+            coarse.standard_error,
+            coarse.band_95(),
+            fine.value,
+            fine.standard_error,
+            fine.band_95()
+        );
+        assert!(coarse.standard_error > 0.0 && fine.standard_error > 0.0);
+        assert!(
+            fine.standard_error <= coarse.standard_error,
+            "standard error should shrink with more replicates ({coarse:?} -> {fine:?})"
         );
     }
 
