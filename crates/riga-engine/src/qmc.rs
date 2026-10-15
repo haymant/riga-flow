@@ -152,9 +152,90 @@ fn radical_inverse_scrambled(mut index: u64, base: u32, perm: &[u32]) -> f64 {
     result
 }
 
+/// Brownian-bridge increments: map `n` iid normals to `n` Brownian increments of
+/// variance `dt`, assigning the terminal point (largest variance) to `normals[0]`.
+/// This concentrates path variance in the low QMC dimensions.
+pub fn brownian_increments_into(normals: &[f64], dt: f64, out: &mut [f64]) {
+    let n = normals.len();
+    assert_eq!(out.len(), n, "bridge output must match the normal count");
+    if n == 0 {
+        return;
+    }
+    let mut path = vec![0.0; n + 1];
+    path[n] = normals[0] * (n as f64 * dt).sqrt();
+    let mut index = 1usize;
+    bridge_fill(&mut path, 0, n, normals, &mut index, dt);
+    for t in 0..n {
+        out[t] = path[t + 1] - path[t];
+    }
+}
+
+fn bridge_fill(
+    path: &mut [f64],
+    lo: usize,
+    hi: usize,
+    normals: &[f64],
+    index: &mut usize,
+    dt: f64,
+) {
+    if hi <= lo + 1 || *index >= normals.len() {
+        return;
+    }
+    let mid = (lo + hi) / 2;
+    let mean = 0.5 * (path[lo] + path[hi]);
+    let variance = ((hi - mid) as f64) * ((mid - lo) as f64) / ((hi - lo) as f64) * dt;
+    path[mid] = mean + normals[*index] * variance.sqrt();
+    *index += 1;
+    bridge_fill(path, lo, mid, normals, index, dt);
+    bridge_fill(path, mid, hi, normals, index, dt);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brownian_bridge_increments_have_the_right_variance() {
+        // A long iid normal stream maps to increments with variance ~dt and a terminal
+        // level with variance ~n*dt.
+        let n = 64usize;
+        let dt = 1.0 / 252.0;
+        let mut increments = vec![0.0; n];
+        let mut terminal = Vec::new();
+        // Deterministic pseudo-random uniforms in (0.05, 0.95).
+        let mut state = 12345u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        let reps = 20_000;
+        let mut inc_m2 = 0.0;
+        let mut term_m2 = 0.0;
+        for _ in 0..reps {
+            let normals: Vec<f64> = (0..n).map(|_| crate::qmc::probit(0.5 + next())).collect();
+            crate::qmc::brownian_increments_into(&normals, dt, &mut increments);
+            for value in &increments {
+                inc_m2 += value * value;
+            }
+            terminal.push(increments.iter().sum::<f64>());
+        }
+        for value in &terminal {
+            term_m2 += value * value;
+        }
+        let inc_var = inc_m2 / (reps * n) as f64;
+        let term_var = term_m2 / reps as f64;
+        assert!(
+            (inc_var - dt).abs() < 0.05 * dt,
+            "increment variance {inc_var} should be ~{dt}"
+        );
+        assert!(
+            (term_var - n as f64 * dt).abs() < 0.1 * n as f64 * dt,
+            "terminal variance {term_var} should be ~{}",
+            n as f64 * dt
+        );
+    }
 
     #[test]
     fn radical_inverse_matches_van_der_corput() {

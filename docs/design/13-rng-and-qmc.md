@@ -69,11 +69,11 @@ RNG micro-optimisation) and enables it by default (`sobol` feature).
   fewer paths.
 
 > **Implemented.** `riga_engine::qmc` provides a digit-scrambled **Halton** ladder with
-> inverse-CDF normals, selected by `SimulationConfig.variance_reduction = { kind: "halton",
-> dimension }`. Draws are CRN-shared across bumps and no Brownian cube is materialised;
-> `PathIdentity.sobol_index` is populated. Measured **1.41×** variance reduction at low QMC
-> dimension; the full ~210-dimension path generation is weak and still needs Sobol
-> direction-number tables plus a Brownian bridge.
+> inverse-CDF normals and a **Brownian bridge**, selected by `SimulationConfig.variance_reduction
+> = { kind: "halton", dimension }`. Draws are CRN-shared across bumps and no Brownian cube is
+> materialised; `PathIdentity.sobol_index` is populated. Measured variance reduction is marginal
+> for this discontinuous, high-dimensional barrier payoff (**~1.05×** at the full ~210-dim path);
+> real gains need Sobol direction-number tables + Owen scrambling.
 
 ## 5. Where RNG reuse genuinely pays: CRN
 

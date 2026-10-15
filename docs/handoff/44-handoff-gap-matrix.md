@@ -106,11 +106,12 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
 
 ## 8. Remaining open gates (engine side)
 
-1. **Sobol / QMC variance reduction** — implemented as a **digit-scrambled Halton** ladder
-   (`riga_engine::qmc`, `VarianceReduction::Halton`, inverse-CDF normals, CRN-shared, no cube
-   materialised; `PathIdentity.sobol_index` populated). Evidence: **1.41×** variance reduction at
-   low QMC dimension, but **weak at the full path dimension (~210)** — high-dimensional path
-   generation still needs Sobol direction-number tables + a Brownian bridge.
+1. **Sobol / QMC variance reduction** — implemented as a **digit-scrambled Halton** ladder with a
+   **Brownian bridge** (`riga_engine::qmc`, `VarianceReduction::Halton`, inverse-CDF normals,
+   CRN-shared, no cube materialised; `PathIdentity.sobol_index` populated). Evidence: **1.05×**
+   variance reduction at the full ~210-dim path and **0.75×** at low dimension — marginal, because
+   the payoff is discontinuous and high-dimensional. Meaningful gains need **Sobol
+   direction-number tables + Owen scrambling** (research-level), not just the bridge.
 2. Deepen a few tools: `build_cashflows` per-period timeline (currently per-path aggregate);
    `execution_events` streaming event tape (currently the net snapshot); `root_cause` change-log
    correlation (needs a persisted run history). `valuation_explain` base-vs-current is done.

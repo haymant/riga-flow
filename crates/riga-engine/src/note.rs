@@ -57,6 +57,10 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
         }
         riga_core::VarianceReduction::None => None,
     };
+    let mut qmc_normals: Option<[Vec<f64>; 2]> =
+        qmc.as_ref().map(|_| [vec![0.0; steps], vec![0.0; steps]]);
+    let mut qmc_increments: Option<[Vec<f64>; 2]> =
+        qmc.as_ref().map(|_| [vec![0.0; steps], vec![0.0; steps]]);
 
     let mut pv_moments = OnlineMoments::default();
     let mut ko_funding_moments = OnlineMoments::default();
@@ -76,6 +80,30 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
         let block_end = (block_start + request.config.path_block_size).min(paths);
         for path_id in block_start..block_end {
             let mut spots = [request.market.spots[0], request.market.spots[1]];
+            if let (Some(ladder), Some(normals), Some(increments)) =
+                (&qmc, qmc_normals.as_mut(), qmc_increments.as_mut())
+            {
+                let inv_sqrt_dt = 1.0 / dt.sqrt();
+                let (first, rest) = normals.split_at_mut(1);
+                let (series0, series1) = (&mut first[0], &mut rest[0]);
+                for (step, (n0, n1)) in series0.iter_mut().zip(series1.iter_mut()).enumerate() {
+                    let z = [
+                        ladder.normal(path_id as u64, step * 2),
+                        ladder.normal(path_id as u64, step * 2 + 1),
+                    ];
+                    let mut correlated = [0.0f64; 2];
+                    chol.apply_into(&z, &mut correlated);
+                    *n0 = correlated[0];
+                    *n1 = correlated[1];
+                }
+                crate::qmc::brownian_increments_into(&normals[0], dt, &mut increments[0]);
+                crate::qmc::brownian_increments_into(&normals[1], dt, &mut increments[1]);
+                for series in increments.iter_mut() {
+                    for value in series.iter_mut() {
+                        *value *= inv_sqrt_dt;
+                    }
+                }
+            }
             let mut knocked_out = false;
             let mut redemption_time = request.trade.maturity_years;
             let mut current_period = 0usize;
@@ -87,18 +115,17 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             let mut final_worst = 1.0;
 
             for step in 0..steps {
-                let (z0, z1_independent) = match &qmc {
-                    Some(ladder) => {
-                        let base = step * 2;
-                        (
-                            ladder.normal(path_id as u64, base),
-                            ladder.normal(path_id as u64, base + 1),
-                        )
-                    }
-                    None => (rng.sample(StandardNormal), rng.sample(StandardNormal)),
-                };
                 let mut shocks = [0.0f64; 2];
-                chol.apply_into(&[z0, z1_independent], &mut shocks);
+                match (&qmc, qmc_increments.as_ref()) {
+                    (Some(_), Some(increments)) => {
+                        shocks = [increments[0][step], increments[1][step]];
+                    }
+                    _ => {
+                        let z0: f64 = rng.sample(StandardNormal);
+                        let z1: f64 = rng.sample(StandardNormal);
+                        chol.apply_into(&[z0, z1], &mut shocks);
+                    }
+                }
                 // Continue evolving the market path after KO for the unconditional terminal-KI
                 // diagnostic; note cashflows stop. Consuming the full shock schedule also keeps
                 // each path's random stream invariant under CRN bumps.
