@@ -137,8 +137,12 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
 The downstream build prompt is [`45-fina-builder-build-handoff-prompt.md`](45-fina-builder-build-handoff-prompt.md).
 It adds the payoff Petri net + transition/token detail panels, schema-driven trade/market controls,
 an evidence→tile map, a lineage/explainability dashboard template + notebook, reactive re-eval, a
-title-bar trace-level selector, and the riga-flow MCP linkage (stdio + HTTP). Three **optional**
-engine deltas are tracked there (§13) and are **not** blockers:
+title-bar trace-level selector, and the riga-flow MCP linkage (stdio + HTTP). It also wires the
+**`tac-engine`** market-data MCP (Alpaca + tac-lake) as a second stdio server so the market-data
+tiles fetch and manipulate real market data, and vendors both engines as git submodules
+(`modules/riga-flow`, `modules/tac-engine`) resolving at the default relative binary path. Three
+**optional** riga-flow deltas (and three tac-engine deltas) are tracked there (§13) and are **not**
+blockers:
 
 - **R-EXT-2** `query_place_tokens` — first-class per-place token listing (today: sampled via `execution_events` + `query_path_cube`).
 - **R-EXT-1** N-factor + FX market model — makes FX/FX-vol live (today: presentational; riga-flow is 2-factor equity).
