@@ -17,3 +17,10 @@ jobs:
       - run: cargo test --workspace
       - name: Ensure adapters do not contain pricing kernels
         run: '! grep -R -nE "StandardNormal|knock_in_barrier|\.exp\(\)" crates/riga-cli/src'
+
+  dependency-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Per-crate dependency allowlist + no-ui
+        run: ./scripts/dep_hygiene.sh

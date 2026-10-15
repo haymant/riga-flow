@@ -5,11 +5,24 @@ use riga_core::{
     DeterminismEnvelope, LedgerEntry, LegAttribution, MarketSnapshot, PhoenixTrade, PriceResult,
     RigaError, SimulationConfig, TraceLevel, TransitionStats,
 };
+use riga_market::ImpliedVolGrid;
 use serde::{Deserialize, Serialize};
 
+pub mod explain;
 pub mod fixture;
 pub mod graph;
 pub mod note;
+pub mod payoff;
+pub mod simd;
+/// Optional local-volatility model inputs.
+///
+/// When present on a [`PriceRequest`], the engine propagates each factor under
+/// its Dupire local-vol surface instead of the flat `market.vols` GBM proxy.
+/// `grids` is aligned with `market.spots`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalVolSpec {
+    pub grids: Vec<ImpliedVolGrid>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PriceRequest {
@@ -18,6 +31,9 @@ pub struct PriceRequest {
     pub config: SimulationConfig,
     /// Explicit valuation date; the engine never reads the wall clock.
     pub as_of: String,
+    /// Optional Dupire local-vol surfaces (one per factor). Absent ⇒ flat-ATM GBM proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_vol: Option<LocalVolSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,7 +171,29 @@ fn price_terminal_put(request: &PriceRequest) -> Result<PriceResult, RigaError> 
 }
 
 pub fn price_put_leg(request: &PriceRequest) -> Result<PriceResult, RigaError> {
+    gpu_backend()?;
     note::price_full_phoenix(request)
+}
+
+/// GPU backend availability.
+///
+/// riga-flow ships no GPU kernel. Building with the `gpu` feature is a statement
+/// that a GPU backend is present; if it is not, the engine must fail loudly
+/// rather than silently fall back to the CPU (acceptance AC-10, invariant I-L3).
+pub fn gpu_backend() -> Result<(), RigaError> {
+    if cfg!(feature = "gpu") {
+        Err(RigaError::new(
+            "gpu_unavailable",
+            "gpu feature is enabled but no GPU backend is present; refusing silent CPU fallback",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether this build advertises a GPU backend.
+pub fn gpu_enabled() -> bool {
+    cfg!(feature = "gpu")
 }
 
 pub(crate) fn validate(request: &PriceRequest) -> Result<(), RigaError> {
@@ -261,7 +299,37 @@ pub(crate) fn validate(request: &PriceRequest) -> Result<(), RigaError> {
             "strike must be positive and barriers finite",
         ));
     }
+    if let Some(spec) = &request.local_vol
+        && spec.grids.len() != market.spots.len()
+    {
+        return Err(RigaError::new(
+            "invalid_local_vol",
+            "local_vol.grids must be aligned with market.spots",
+        ));
+    }
     Ok(())
+}
+
+/// Calibrate one Dupire local-vol surface per factor from the request's implied grids.
+///
+/// `None` when the request carries no local-vol spec (the flat-ATM GBM proxy lane).
+pub fn build_local_vol(
+    request: &PriceRequest,
+) -> Result<Option<Vec<riga_market::DupireLocalVol>>, RigaError> {
+    let Some(spec) = &request.local_vol else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(spec.grids.len());
+    for (factor, grid) in spec.grids.iter().enumerate() {
+        let surface = riga_market::DupireLocalVol::calibrate(
+            grid,
+            request.market.spots[factor],
+            request.market.risk_free_rate,
+        )
+        .map_err(|e| RigaError::new("invalid_local_vol", e))?;
+        out.push(surface);
+    }
+    Ok(Some(out))
 }
 
 /// Inclusive prefix sum.
@@ -489,5 +557,20 @@ mod tests {
             trace_event(TraceLevel::Sampled, "ki_gate", 17).as_deref(),
             Some("ki_gate:17")
         );
+    }
+
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn gpu_build_fails_loudly_without_a_backend() {
+        assert!(gpu_enabled());
+        let error = gpu_backend().unwrap_err();
+        assert_eq!(error.code, "gpu_unavailable");
+    }
+
+    #[test]
+    #[cfg(not(feature = "gpu"))]
+    fn cpu_build_has_no_gpu_backend_and_is_portable() {
+        assert!(!gpu_enabled());
+        assert!(gpu_backend().is_ok());
     }
 }

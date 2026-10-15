@@ -21,19 +21,23 @@ Start at [`docs/README.md`](docs/README.md). The tree is organised as:
 | [`docs/plan/`](docs/plan/) | roadmap, build plan, acceptance criteria, testing, gaps & risks |
 | [`docs/mcp/`](docs/mcp/) | MCP server design, tool catalog, implementation (`rmcp`) |
 | [`docs/handoff/`](docs/handoff/) | handoff to `fina-builder` for the visual atlas |
-| [`docs/fixture/`](docs/fixture/) | pinned reference fixtures — e.g. [`termsheet1`](docs/fixture/termsheet1.md) (real terms) + [`termsheet1.json`](docs/fixture/termsheet1.json) (market data + trade economics) |
+| [`docs/fixture/`](docs/fixture/) | pinned reference fixtures — [`termsheet1.md`](docs/fixture/termsheet1.md) (full real term sheet), [`termsheet1.md.json`](docs/fixture/termsheet1.md.json) (captured fina-risk market + instrument), [`termsheet1.json`](docs/fixture/termsheet1.json) (pinned riga market data + trade economics), and the [`PUT reconciliation`](docs/fixture/termsheet1-put-reconciliation.md) |
 
 ## Status
 
-The branch includes a **CPU full-Phoenix GBM proxy** (daily global KO, coupon accrual/memory,
-final-fixing EKI, redemption and discounted leg attribution), a deterministic graph runtime,
-FD/CRN Greeks, composition clustering/scheduling metadata, and thin MCP stdio/Streamable HTTP
-adapters. The canonical `termsheet1` source fixture is loaded with its trade terms and market
-inputs, but its own provenance marks key curves/surface/coupon/payment fields as reference
-placeholders and supplies no current as-of spots (the proxy starts from the initial fixings).
-Therefore the issuer PUT threshold is **blocked pending market capture**, not
-reported as passed; the executed flat-ATM GBM proxy result is recorded in the phase evidence.
-Calibrated Dupire LV, tensorized 100k-trade execution, SIMD/GPU, full MCP long-run features, and
-the user-deferred `fina-builder` handoff remain outside the completed gates. See the
-[phase-by-phase evidence report](docs/plan/25-implementation-evidence.md) for per-phase exit
-criteria, evidence and blockers, and the roadmap in [`docs/plan/20-roadmap.md`](docs/plan/20-roadmap.md).
+The branch includes a **CPU full-Phoenix engine** with **calibrated Dupire local volatility**
+built from the captured implied smile, alongside the earlier flat-ATM GBM proxy. It implements
+daily global KO, coupon accrual/memory, final-fixing EKI, redemption and discounted leg
+attribution; a graph-composed payoff runtime with scan-lowered memory carry; CRN FD Greeks with
+a measured variance-reduction factor; composition clustering with an LRU scenario cache and
+100k-trade occupancy evidence; a batched risk report with PnL explain; replay / PathCube
+queries; a portable SIMD worst-of kernel; and a `gpu` feature that fails loudly with no silent
+CPU fallback.
+
+The captured `termsheet1` market (as-of marks, full smile, curve, resolved correlation) is pinned
+in [`docs/fixture/termsheet1.json`](docs/fixture/termsheet1.json), and the PUT leg now reconciles
+to **0.020505** — **−2.91%** of the `0.02112` anchor, inside the ±5% AC-C0 band, with fixture
+acceptance **`passed`**. See the [phase-by-phase evidence report](docs/plan/25-implementation-evidence.md)
+for per-phase exit criteria, evidence and remaining work, and the
+[PUT reconciliation investigation](docs/fixture/termsheet1-put-reconciliation.md). The `fina-builder`
+handoff remains deferred.

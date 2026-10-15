@@ -26,6 +26,10 @@ pub struct CentralDifferenceConfig {
     pub spot_relative_bump: f64,
     /// Absolute volatility bump. For volatility `sigma`, scenarios are `sigma +/- bump`.
     pub volatility_absolute_bump: f64,
+    /// Absolute rate bump (a parallel shift) used for DV01.
+    pub rate_absolute_bump: f64,
+    /// Absolute correlation bump used for the correlation sensitivity.
+    pub correlation_absolute_bump: f64,
     /// Must be [`RandomNumberPolicy::CommonRandomNumbers`].
     pub random_number_policy: RandomNumberPolicy,
 }
@@ -35,6 +39,8 @@ impl Default for CentralDifferenceConfig {
         Self {
             spot_relative_bump: 0.01,
             volatility_absolute_bump: 0.01,
+            rate_absolute_bump: 0.0001,
+            correlation_absolute_bump: 0.01,
             random_number_policy: RandomNumberPolicy::CommonRandomNumbers,
         }
     }
@@ -183,6 +189,55 @@ fn price_with_common_seed(request: &PriceRequest, seed: u64) -> Result<PriceResu
     price_put_leg(&scenario)
 }
 
+fn sample_variance(values: &[f64]) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1.0)
+}
+
+/// Estimate the CRN variance-reduction factor for a central-FD spot delta on asset 0.
+///
+/// For each replicate the delta is estimated twice — once reusing one seed for the
+/// base/up/down scenarios (CRN) and once with three independent seeds. The factor is
+/// `variance(independent) / variance(CRN)` across the replicates; a factor well above
+/// one is the CRN variance reduction the FD Greeks depend on (Phase 5 evidence).
+pub fn crn_variance_reduction_factor(
+    request: &PriceRequest,
+    config: &CentralDifferenceConfig,
+    replicates: usize,
+) -> Result<f64, RigaError> {
+    validate_configuration(request, config)?;
+    let asset = 0usize;
+    let h = request.market.spots[asset] * config.spot_relative_bump;
+    let mut crn = Vec::with_capacity(replicates);
+    let mut independent = Vec::with_capacity(replicates);
+    for r in 0..replicates as u64 {
+        let bump = |seed: u64, delta: f64| -> Result<f64, RigaError> {
+            let mut scenario = request.clone();
+            scenario.market.spots[asset] += delta;
+            scenario.config.seed = seed;
+            Ok(price_put_leg(&scenario)?.pv)
+        };
+        // CRN: identical stream for up and down.
+        let seed = 1_000 + r;
+        let d_crn = (bump(seed, h)? - bump(seed, -h)?) / (2.0 * h);
+        // Independent streams.
+        let d_ind = (bump(50_000 + 3 * r, h)? - bump(50_000 + 3 * r + 1, -h)?) / (2.0 * h);
+        crn.push(d_crn);
+        independent.push(d_ind);
+    }
+    let crn_var = sample_variance(&crn);
+    let ind_var = sample_variance(&independent);
+    Ok(if crn_var > 0.0 {
+        ind_var / crn_var
+    } else {
+        f64::INFINITY
+    })
+}
+
 fn validate_configuration(
     request: &PriceRequest,
     config: &CentralDifferenceConfig,
@@ -209,6 +264,18 @@ fn validate_configuration(
         return Err(RigaError::new(
             "invalid_volatility_bump",
             "volatility_absolute_bump must be finite and positive",
+        ));
+    }
+    if !config.rate_absolute_bump.is_finite() || config.rate_absolute_bump <= 0.0 {
+        return Err(RigaError::new(
+            "invalid_rate_bump",
+            "rate_absolute_bump must be finite and positive",
+        ));
+    }
+    if !config.correlation_absolute_bump.is_finite() || config.correlation_absolute_bump <= 0.0 {
+        return Err(RigaError::new(
+            "invalid_correlation_bump",
+            "correlation_absolute_bump must be finite and positive",
         ));
     }
     if request.market.spots.len() != request.market.vols.len() || request.market.spots.is_empty() {
@@ -240,6 +307,205 @@ fn validate_configuration(
         }
     }
     Ok(())
+}
+
+/// One risk factor addressable by the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiskFactor {
+    Spot(usize),
+    Volatility(usize),
+    Rate,
+    Correlation,
+}
+
+/// A per-asset Greek subset for the batch report.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BatchAssetGreeks {
+    pub asset_index: usize,
+    pub delta: f64,
+    pub gamma: f64,
+    pub vega: f64,
+    pub delta_mc_error: f64,
+    pub vega_mc_error: f64,
+}
+
+/// The full central-FD scenario batch for one trade: base + every bumped valuation.
+///
+/// `scenario_count` is the number of engine valuations in the batch
+/// (`1 + 4·n_assets + 4` for the current factor set: base, spot/vol up+down per
+/// asset, rate up+down, correlation up+down).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchRiskReport {
+    pub base_pv: f64,
+    pub scenario_count: usize,
+    pub seed: u64,
+    pub assets: Vec<BatchAssetGreeks>,
+    pub rate_up_pv: f64,
+    pub rate_down_pv: f64,
+    pub correlation_up_pv: f64,
+    pub correlation_down_pv: f64,
+    pub rate_bump: f64,
+    pub correlation_bump: f64,
+    pub pv_mc_error: f64,
+}
+
+impl BatchRiskReport {
+    /// DV01: `dPV / d(parallel shift)`, per 1.00 of rate.
+    pub fn dv01(&self) -> f64 {
+        (self.rate_up_pv - self.rate_down_pv) / (2.0 * self.rate_bump)
+    }
+
+    /// Correlation sensitivity: `dPV / d(rho)`.
+    pub fn correlation_sensitivity(&self) -> f64 {
+        (self.correlation_up_pv - self.correlation_down_pv) / (2.0 * self.correlation_bump)
+    }
+}
+
+/// Price the full central-FD scenario batch with common random numbers.
+///
+/// This is the batched FD evaluation the book-level risk engine consumes: one
+/// base and a central up/down pair per factor, all sharing the request seed so
+/// the bumped differences are CRN (Phase 10 / invariant I-C4).
+pub fn price_risk_batch(
+    request: &PriceRequest,
+    config: &CentralDifferenceConfig,
+) -> Result<BatchRiskReport, RigaError> {
+    validate_configuration(request, config)?;
+    let seed = request.config.seed;
+    let base = price_with_common_seed(request, seed)?;
+    let greeks = price_central_greeks(request, config)?;
+    let assets = greeks
+        .assets
+        .iter()
+        .map(|asset| BatchAssetGreeks {
+            asset_index: asset.asset_index,
+            delta: asset.delta.value,
+            gamma: asset.gamma.value,
+            vega: asset.vega.value,
+            delta_mc_error: asset.delta.mc_error_upper_bound,
+            vega_mc_error: asset.vega.mc_error_upper_bound,
+        })
+        .collect::<Vec<_>>();
+
+    let n = request.market.spots.len();
+    let rate = |delta: f64| -> Result<f64, RigaError> {
+        let mut scenario = request.clone();
+        scenario.market.risk_free_rate += delta;
+        scenario.config.seed = seed;
+        Ok(price_put_leg(&scenario)?.pv)
+    };
+    let correlation = |delta: f64| -> Result<f64, RigaError> {
+        let mut scenario = request.clone();
+        scenario.market.correlation[0][1] += delta;
+        scenario.market.correlation[1][0] += delta;
+        scenario.config.seed = seed;
+        Ok(price_put_leg(&scenario)?.pv)
+    };
+    let hr = config.rate_absolute_bump;
+    let hc = config.correlation_absolute_bump;
+    Ok(BatchRiskReport {
+        base_pv: base.pv,
+        scenario_count: 1 + 4 * n + 4,
+        seed,
+        assets,
+        rate_up_pv: rate(hr)?,
+        rate_down_pv: rate(-hr)?,
+        correlation_up_pv: correlation(hc)?,
+        correlation_down_pv: correlation(-hc)?,
+        rate_bump: hr,
+        correlation_bump: hc,
+        pv_mc_error: base.mc_error,
+    })
+}
+
+/// A named factor move for P&L explain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactorMove {
+    pub label: String,
+    pub contribution: f64,
+}
+
+/// Second-order Taylor P&L explain from the batch report and observed factor moves.
+///
+/// `spot_moves[i]` / `vol_moves[i]` are absolute changes; `rate_move` and
+/// `corr_move` are absolute. Contributions are `delta·ds + ½·gamma·ds²`,
+/// `vega·dvol`, `dv01·dr`, and `corr_sens·dcorr`.
+pub fn pnl_explain(
+    report: &BatchRiskReport,
+    spot_moves: &[f64],
+    vol_moves: &[f64],
+    rate_move: f64,
+    corr_move: f64,
+) -> Vec<FactorMove> {
+    let mut out = Vec::new();
+    for asset in &report.assets {
+        let i = asset.asset_index;
+        let ds = spot_moves.get(i).copied().unwrap_or(0.0);
+        let dv = vol_moves.get(i).copied().unwrap_or(0.0);
+        if ds != 0.0 || asset.delta != 0.0 || asset.gamma != 0.0 {
+            out.push(FactorMove {
+                label: format!("spot[{i}]"),
+                contribution: asset.delta * ds + 0.5 * asset.gamma * ds * ds,
+            });
+        }
+        if dv != 0.0 || asset.vega != 0.0 {
+            out.push(FactorMove {
+                label: format!("vol[{i}]"),
+                contribution: asset.vega * dv,
+            });
+        }
+    }
+    if rate_move != 0.0 {
+        out.push(FactorMove {
+            label: "rate".into(),
+            contribution: report.dv01() * rate_move,
+        });
+    }
+    if corr_move != 0.0 {
+        out.push(FactorMove {
+            label: "correlation".into(),
+            contribution: report.correlation_sensitivity() * corr_move,
+        });
+    }
+    out
+}
+
+/// Aggregated book-level risk summed across trades scaled by notional.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PortfolioRisk {
+    pub trades: usize,
+    pub pv: f64,
+    pub delta: Vec<f64>,
+    pub gamma: Vec<f64>,
+    pub vega: Vec<f64>,
+    pub dv01: f64,
+    pub correlation_sensitivity: f64,
+}
+
+/// Sum per-trade risk into a book risk view (`notional` is per-unit-of-notional
+/// for each row).
+pub fn aggregate_portfolio(rows: &[(f64, BatchRiskReport)]) -> PortfolioRisk {
+    let mut out = PortfolioRisk {
+        trades: rows.len(),
+        ..PortfolioRisk::default()
+    };
+    for (notional, report) in rows {
+        out.pv += notional * report.base_pv;
+        out.dv01 += notional * report.dv01();
+        out.correlation_sensitivity += notional * report.correlation_sensitivity();
+        for asset in &report.assets {
+            let i = asset.asset_index;
+            while out.delta.len() <= i {
+                out.delta.push(0.0);
+                out.gamma.push(0.0);
+                out.vega.push(0.0);
+            }
+            out.delta[i] += notional * asset.delta;
+            out.gamma[i] += notional * asset.gamma;
+            out.vega[i] += notional * asset.vega;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -356,5 +622,58 @@ mod tests {
         };
         let error = price_central_greeks(&request, &config).unwrap_err();
         assert_eq!(error.code, "invalid_volatility_bump");
+    }
+
+    #[test]
+    fn crn_reduces_the_delta_estimator_variance() {
+        let request = small_termsheet_request();
+        let factor =
+            crn_variance_reduction_factor(&request, &CentralDifferenceConfig::default(), 40)
+                .unwrap();
+        eprintln!("CRN variance-reduction factor = {factor:.2}x");
+        assert!(
+            factor > 1.5,
+            "CRN should materially reduce the FD delta variance, factor={factor:.2}"
+        );
+    }
+
+    #[test]
+    fn batch_risk_reports_all_scenarios_and_aggregates() {
+        let request = small_termsheet_request();
+        let config = CentralDifferenceConfig::default();
+        let report = price_risk_batch(&request, &config).unwrap();
+        assert_eq!(report.scenario_count, 1 + 4 * 2 + 4);
+        assert_eq!(report.assets.len(), 2);
+        assert!(report.base_pv.is_finite() && report.dv01().is_finite());
+        assert!(report.correlation_sensitivity().is_finite());
+
+        let explain = pnl_explain(&report, &[0.0, 0.0], &[0.0, 0.0], 0.0001, 0.0);
+        let rate = explain.iter().find(|m| m.label == "rate").unwrap();
+        assert!((rate.contribution - report.dv01() * 0.0001).abs() < 1e-15);
+
+        let portfolio =
+            aggregate_portfolio(&[(10_000.0, report.clone()), (5_000.0, report.clone())]);
+        assert_eq!(portfolio.trades, 2);
+        assert!((portfolio.pv - 15_000.0 * report.base_pv).abs() < 1e-9);
+        assert_eq!(portfolio.delta.len(), 2);
+    }
+
+    #[test]
+    fn pnl_explain_tracks_a_spot_reprice() {
+        let request = small_termsheet_request();
+        let config = CentralDifferenceConfig::default();
+        let report = price_risk_batch(&request, &config).unwrap();
+        let h = request.market.spots[0] * config.spot_relative_bump;
+        let mut bumped = request.clone();
+        bumped.market.spots[0] += h;
+        let actual = price_put_leg(&bumped).unwrap().pv - report.base_pv;
+        let total: f64 = pnl_explain(&report, &[h, 0.0], &[0.0, 0.0], 0.0, 0.0)
+            .iter()
+            .map(|m| m.contribution)
+            .sum();
+        assert!(
+            (total - actual).abs() < 1e-3,
+            "Taylor explain {total} vs actual {actual}"
+        );
     }
 }

@@ -756,9 +756,20 @@ dependencies = [
  "rand_chacha",
  "rand_distr",
  "riga-core",
+ "riga-market",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "riga-market"
+version = "0.1.0"
+dependencies = [
+ "riga-core",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -769,6 +780,7 @@ dependencies = [
  "axum",
  "riga-core",
  "riga-engine",
+ "riga-risk",
  "rmcp",
  "schemars",
  "serde",

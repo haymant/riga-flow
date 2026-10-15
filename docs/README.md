@@ -44,7 +44,8 @@ is pinned at **≈ 0.02112** (see [`plan/23-testing-validation.md`](plan/23-test
 | The MCP tool / resource / prompt catalog | [`mcp/31-mcp-tool-catalog.md`](mcp/31-mcp-tool-catalog.md) |
 | The MCP implementation plan (`rmcp`) | [`mcp/32-mcp-implementation.md`](mcp/32-mcp-implementation.md) |
 | The handoff to `fina-builder` | [`handoff/40-fina-builder-handoff.md`](handoff/40-fina-builder-handoff.md) |
-| Inspect the first end-to-end reference fixture (real term sheet + market data/economics) | [`fixture/termsheet1.md`](fixture/termsheet1.md), [`fixture/termsheet1.json`](fixture/termsheet1.json) |
+| Inspect the first end-to-end reference fixture (real term sheet + captured market data/economics) | [`fixture/termsheet1.md`](fixture/termsheet1.md), [`fixture/termsheet1.md.json`](fixture/termsheet1.md.json), [`fixture/termsheet1.json`](fixture/termsheet1.json), [`fixture/termsheet1-put-reconciliation.md`](fixture/termsheet1-put-reconciliation.md) |
+| Understand how the captured smile reconciled the PUT leg | [`fixture/termsheet1-put-reconciliation.md`](fixture/termsheet1-put-reconciliation.md) |
 
 ### Document status legend
 

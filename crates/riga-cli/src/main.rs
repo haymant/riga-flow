@@ -24,7 +24,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.get(1).map(String::as_str) == Some("health") {
         println!(
             "{}",
-            json!({"version": env!("CARGO_PKG_VERSION"), "engine":"riga-engine", "features":{"cpu_gbm":true,"gpu":false,"aad":false}})
+            json!({"version": env!("CARGO_PKG_VERSION"), "engine":"riga-engine", "features":{"cpu_gbm":true,"gpu":riga_engine::gpu_enabled(),"aad":false}})
         );
         return Ok(());
     }

@@ -1,4 +1,5 @@
-use riga_engine::{PriceRequest, fixture::load_termsheet1_fixture, price_put_leg};
+use riga_engine::fixture::load_termsheet1_fixture;
+use riga_engine::{PriceRequest, explain, price_put_leg};
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool,
     tool_router, transport::stdio,
@@ -48,6 +49,41 @@ struct PricePutParams {
     fixture_path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReplayPathParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Zero-based path id to reconstruct.
+    path_id: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PathCubeParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Fraction in [0, 1]; e.g. 0.05 selects the worst 5% of paths.
+    percentile: f64,
+    /// Maximum number of sample paths returned.
+    #[serde(default = "default_sample_size")]
+    max_sample: usize,
+}
+
+fn default_sample_size() -> usize {
+    16
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RiskBatchParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+}
+
 #[tool_router(server_handler)]
 impl RigaMcp {
     #[tool(description = "Report riga-mcp liveness, version, and enabled engine features.")]
@@ -58,7 +94,7 @@ impl RigaMcp {
             "engine": "riga-engine",
             "features": {
                 "cpu_gbm": true,
-                "gpu": false,
+                "gpu": riga_engine::gpu_enabled(),
                 "aad": false
             }
         }))
@@ -87,6 +123,112 @@ impl RigaMcp {
             Err(error) => structured_error(error.code, error.message),
         }
     }
+
+    #[tool(
+        description = "Explain the fixture PV: leg attribution, Explain Ledger and transition statistics (AC-X1/AC-X2)."
+    )]
+    fn explain_pv_attribution(
+        &self,
+        Parameters(params): Parameters<PricePutParams>,
+    ) -> CallToolResult {
+        let path = self.resolve(&params.fixture_path);
+        match load_and_price(&path) {
+            Ok((fixture, result)) => structured_success(json!({
+                "legs": result.legs,
+                "ledger": result.ledger,
+                "stats": result.stats,
+                "ki_probability": result.ki_probability,
+                "determinism": result.determinism,
+                "engine_model": fixture.engine_model,
+            })),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Reconstruct a single simulated path from its identity (path_id, seed) alone (AC-X5/AC-X6)."
+    )]
+    fn replay_path(&self, Parameters(params): Parameters<ReplayPathParams>) -> CallToolResult {
+        let path = self.resolve(&params.fixture_path);
+        match load_fixture(&path).and_then(|fixture| {
+            explain::reconstruct_path(&fixture.request, params.path_id)
+                .map_err(ToolError::from_engine)
+        }) {
+            Ok(record) => structured_success(serde_json::to_value(record).unwrap_or(Value::Null)),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "PathCube query: the worst `percentile` of simulated paths by final worst-of performance."
+    )]
+    fn query_path_cube(&self, Parameters(params): Parameters<PathCubeParams>) -> CallToolResult {
+        let path = self.resolve(&params.fixture_path);
+        match load_fixture(&path).and_then(|fixture| {
+            explain::query_worst_percentile(&fixture.request, params.percentile, params.max_sample)
+                .map_err(ToolError::from_engine)
+        }) {
+            Ok(query) => structured_success(serde_json::to_value(query).unwrap_or(Value::Null)),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Central-FD risk batch (spot/vol/rate/correlation) with CRN for the fixture, plus DV01 and correlation sensitivity."
+    )]
+    fn risk_batch(&self, Parameters(params): Parameters<RiskBatchParams>) -> CallToolResult {
+        let path = self.resolve(&params.fixture_path);
+        match load_fixture(&path).and_then(|fixture| {
+            riga_risk::price_risk_batch(
+                &fixture.request,
+                &riga_risk::CentralDifferenceConfig::default(),
+            )
+            .map_err(ToolError::from_engine)
+        }) {
+            Ok(report) => structured_success(risk_batch_json(&report)),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+}
+
+impl RigaMcp {
+    fn resolve(&self, fixture_path: &Option<String>) -> PathBuf {
+        fixture_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.default_fixture_path.clone())
+    }
+}
+
+fn load_fixture(path: &Path) -> Result<riga_engine::fixture::LoadedFixture, ToolError> {
+    load_termsheet1_fixture(path).map_err(ToolError::from_engine)
+}
+
+fn load_and_price(
+    path: &Path,
+) -> Result<(riga_engine::fixture::LoadedFixture, riga_core::PriceResult), ToolError> {
+    let fixture = load_fixture(path)?;
+    let result = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
+    Ok((fixture, result))
+}
+
+fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
+    json!({
+        "base_pv": report.base_pv,
+        "scenario_count": report.scenario_count,
+        "seed": report.seed,
+        "pv_mc_error": report.pv_mc_error,
+        "dv01": report.dv01(),
+        "correlation_sensitivity": report.correlation_sensitivity(),
+        "assets": report.assets.iter().map(|a| json!({
+            "asset_index": a.asset_index,
+            "delta": a.delta,
+            "gamma": a.gamma,
+            "vega": a.vega,
+            "delta_mc_error": a.delta_mc_error,
+            "vega_mc_error": a.vega_mc_error,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Debug)]
@@ -370,15 +512,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_fixture_is_blocked_until_market_capture_is_pinned() {
+    fn canonical_fixture_passes_once_market_capture_is_pinned() {
         let value = price_fixture_value(&default_fixture_path()).expect("fixture prices");
         let acceptance = &value["fixture_acceptance"];
-        assert_eq!(
-            acceptance["status"],
-            Value::String("blocked_pending_market_capture".into())
+        assert_eq!(acceptance["status"], Value::String("passed".into()));
+        assert_eq!(acceptance["passed"], Value::Bool(true));
+        let put = value["result"]["legs"]["down_and_in_put"]
+            .as_f64()
+            .expect("put leg");
+        assert!(
+            (put - 0.02112).abs() / 0.02112 <= 0.05,
+            "PUT {put} outside AC-C0 band"
         );
-        assert!(acceptance["passed"].is_null());
-        assert!(acceptance["numeric_band_check"].is_null());
+        assert_eq!(
+            value["fixture"]["engine_model"],
+            Value::String("dupire_local_vol_calibrated_cpu".into())
+        );
     }
 
     #[test]

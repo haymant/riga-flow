@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/riga-core",
+  "crates/riga-market",
   "crates/riga-engine",
   "crates/riga-cli",
   "crates/riga-risk",

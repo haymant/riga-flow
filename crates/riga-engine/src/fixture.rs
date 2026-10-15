@@ -1,5 +1,6 @@
-use crate::{FixtureExpected, PriceRequest};
+use crate::{FixtureExpected, LocalVolSpec, PriceRequest};
 use riga_core::{MarketSnapshot, PhoenixTrade, RigaError, SimulationConfig, TraceLevel};
+use riga_market::ImpliedVolGrid;
 use serde_json::Value;
 use std::path::Path;
 
@@ -259,7 +260,77 @@ pub fn load_termsheet1_fixture(path: impl AsRef<Path>) -> Result<LoadedFixture, 
     } else {
         weekday_steps(as_of, call_start)?
     };
+    // Current as-of marks (captured). When absent, fall back to the pinned initial fixings.
+    let quoted_spots: Vec<f64> = names
+        .iter()
+        .map(|n| {
+            root["market_data"]["as_of_spots"][*n]
+                .as_f64()
+                .or_else(|| root["market_data"]["initial_fixings"]["spots"][*n].as_f64())
+                .unwrap_or(f64::NAN)
+        })
+        .collect();
+    // Optional full implied-vol grids → Dupire local vol (one per factor).
+    let local_vol = match root["market_data"]["local_vol_surfaces"].as_object() {
+        Some(surfaces) if !surfaces.is_empty() => {
+            let mut grids = Vec::with_capacity(names.len());
+            for name in &names {
+                let node = &surfaces[*name];
+                let rows = node["maturities"].as_array().ok_or_else(|| {
+                    RigaError::new(
+                        "fixture_missing_field",
+                        format!("local_vol_surfaces.{name}.maturities is required"),
+                    )
+                })?;
+                let raw_strikes = node["strikes"].as_array().ok_or_else(|| {
+                    RigaError::new(
+                        "fixture_missing_field",
+                        format!("local_vol_surfaces.{name}.strikes is required"),
+                    )
+                })?;
+                let raw_vols = node["vols"].as_array().ok_or_else(|| {
+                    RigaError::new(
+                        "fixture_missing_field",
+                        format!("local_vol_surfaces.{name}.vols is required"),
+                    )
+                })?;
+                let mut with_tenor: Vec<(f64, Vec<f64>)> = Vec::with_capacity(rows.len());
+                for (k, row) in rows.iter().enumerate() {
+                    let date = row.as_str().ok_or_else(|| {
+                        RigaError::new("fixture_invalid_field", "local vol maturity must be a date")
+                    })?;
+                    let years = (civil_day_number(date)? - civil_day_number(as_of)?) as f64 / 365.0;
+                    let vols = raw_vols
+                        .get(k)
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            RigaError::new(
+                                "fixture_invalid_field",
+                                "local vol row count must match maturities",
+                            )
+                        })?
+                        .iter()
+                        .map(|v| v.as_f64().unwrap_or(f64::NAN))
+                        .collect::<Vec<_>>();
+                    with_tenor.push((years, vols));
+                }
+                with_tenor
+                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                grids.push(ImpliedVolGrid {
+                    maturities_years: with_tenor.iter().map(|r| r.0).collect(),
+                    strikes: raw_strikes
+                        .iter()
+                        .map(|v| v.as_f64().unwrap_or(f64::NAN))
+                        .collect(),
+                    vols: with_tenor.into_iter().map(|r| r.1).collect(),
+                });
+            }
+            Some(LocalVolSpec { grids })
+        }
+        _ => None,
+    };
     let request = PriceRequest {
+        local_vol,
         trade: PhoenixTrade {
             trade_id: trade["trade_id"]
                 .as_str()
@@ -296,14 +367,7 @@ pub fn load_termsheet1_fixture(path: impl AsRef<Path>) -> Result<LoadedFixture, 
                 .as_str()
                 .unwrap_or("")
                 .to_owned(),
-            spots: names
-                .iter()
-                .map(|n| {
-                    root["market_data"]["initial_fixings"]["spots"][*n]
-                        .as_f64()
-                        .unwrap_or(f64::NAN)
-                })
-                .collect(),
+            spots: quoted_spots,
             vols: vec![vol0, vol1],
             risk_free_rate,
             dividend_yields: names
@@ -333,6 +397,7 @@ pub fn load_termsheet1_fixture(path: impl AsRef<Path>) -> Result<LoadedFixture, 
         ki_probability: number(&root, "/expected/ki_prob/value")?,
         ki_probability_tolerance: number(&root, "/expected/ki_prob/tol_abs")?,
     };
+    let has_local_vol = request.local_vol.is_some();
     Ok(LoadedFixture {
         name: "termsheet1".into(),
         request,
@@ -345,16 +410,25 @@ pub fn load_termsheet1_fixture(path: impl AsRef<Path>) -> Result<LoadedFixture, 
             .as_array()
             .is_some_and(|items| items.is_empty())
             && root["provenance"].as_object().is_some_and(|items| {
-                items
-                    .values()
-                    .all(|v| v.as_str().is_some_and(|s| s.starts_with("pinned")))
+                items.values().all(|v| {
+                    v.as_str()
+                        .is_some_and(|s| s.starts_with("pinned") || s.starts_with("captured"))
+                })
             }),
-        market_quality_note: "Source provides pinned initial fixings, not current as-of spots; discount, dividend, ATM-vol, coupon-barrier, and payment-lag inputs are tagged reference placeholders.".to_owned(),
+        market_quality_note: if has_local_vol {
+            "Captured fina-risk market: current as-of marks, full implied smile, USD discount curve, and resolved correlation.".to_owned()
+        } else {
+            "Source provides pinned initial fixings, not current as-of spots; discount, dividend, ATM-vol, coupon-barrier, and payment-lag inputs are tagged reference placeholders.".to_owned()
+        },
         source_model: root["model"]["process"]
             .as_str()
             .unwrap_or("unknown")
             .to_owned(),
-        engine_model: "gbm_flat_atm_proxy_from_initial_fixings".to_owned(),
+        engine_model: if has_local_vol {
+            "dupire_local_vol_calibrated_cpu".to_owned()
+        } else {
+            "gbm_flat_atm_proxy_from_initial_fixings".to_owned()
+        },
     })
 }
 
@@ -371,11 +445,11 @@ mod tests {
     fn source_market_inputs_and_trade_economics_are_mapped() {
         let loaded = source_fixture();
         let request = loaded.request;
-        assert_eq!(request.market.spots, vec![239.97, 260.0]);
-        assert!((request.market.vols[0] - 0.336109589).abs() < 0.000001);
-        assert!((request.market.vols[1] - 0.316109589).abs() < 0.000001);
-        assert!((request.market.risk_free_rate - 0.038583562).abs() < 0.000001);
-        assert_eq!(request.market.dividend_yields, vec![0.0065, 0.0]);
+        assert_eq!(request.market.spots, vec![267.885, 258.355]);
+        assert!((request.market.vols[0] - 0.45619).abs() < 0.002);
+        assert!((request.market.vols[1] - 0.35599).abs() < 0.002);
+        assert!((request.market.risk_free_rate - 0.038825).abs() < 0.0005);
+        assert_eq!(request.market.dividend_yields, vec![0.0, 0.002979]);
         assert_eq!(request.market.correlation[0][1], 0.4041);
         assert_eq!(request.trade.initial_spots, vec![239.97, 260.0]);
         assert_eq!(request.trade.strike, 0.78);
@@ -387,17 +461,42 @@ mod tests {
         assert_eq!(request.trade.coupon_periods, Some(5));
         assert!(!request.trade.fixed_first_coupon);
         assert_eq!(request.trade.call_start_step, Some(0));
-        assert!(!loaded.market_is_pinned);
+        assert!(loaded.market_is_pinned);
         assert_eq!(loaded.source_model, "dupire_local_vol");
-        assert_eq!(
-            loaded.engine_model,
-            "gbm_flat_atm_proxy_from_initial_fixings"
-        );
+        assert_eq!(loaded.engine_model, "dupire_local_vol_calibrated_cpu");
         assert!(
             loaded
                 .market_quality_note
-                .contains("not current as-of spots")
+                .contains("Captured fina-risk market")
         );
+        let lv = request.local_vol.expect("captured smile must be present");
+        assert_eq!(lv.grids.len(), 2);
+        assert_eq!(lv.grids[0].maturities_years.len(), 10);
+        assert_eq!(lv.grids[0].strikes.len(), 21);
+        assert_eq!(lv.grids[0].vols.len(), 10);
+        assert_eq!(lv.grids[0].vols[0].len(), 21);
+    }
+
+    #[test]
+    fn calibrated_local_vol_matches_the_reference_grid() {
+        let request = source_fixture().request;
+        let lv = crate::build_local_vol(&request).unwrap().unwrap();
+        // Reference local-vol points from the upstream calibration pipeline at the
+        // fixture horizon (T = 0.40274, ADBE/AMZN). Tolerance covers the rate-forward
+        // convention difference (fixture-interpolated vs first-pillar rate).
+        let cases = [
+            (0usize, 180.0, 0.467727),
+            (0, 268.0, 0.430912),
+            (1, 240.0, 0.346527),
+            (1, 268.0, 0.352650),
+        ];
+        for (factor, s, expected) in cases {
+            let got = lv[factor].sigma(0.40274, s);
+            assert!(
+                (got - expected).abs() < 3.0e-3,
+                "factor {factor} sigma(0.40274, {s}) = {got}, reference {expected}"
+            );
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 riga-core = { path = "../riga-core" }
+riga-market = { path = "../riga-market" }
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
@@ -13,5 +14,11 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[features]
+# GPU path propagation (Phase 9). CPU is the portable default; a `gpu` build must
+# fail loudly rather than silently fall back to CPU (AC-10 / I-L3).
+gpu = []
+simd = []
 
 [dev-dependencies]

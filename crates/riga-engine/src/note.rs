@@ -12,6 +12,7 @@ use riga_core::{
 /// calibrated Dupire local-volatility implementation.
 pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaError> {
     validate(request)?;
+    let local_vol = crate::build_local_vol(request)?;
     let paths = request.config.paths;
     let steps = request.trade.steps;
     let periods = request.trade.coupon_periods.unwrap_or(9).max(1);
@@ -66,7 +67,10 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
                 }
                 let time = (step + 1) as f64 * dt;
                 for factor in 0..2 {
-                    let vol = request.market.vols[factor];
+                    let vol = match &local_vol {
+                        Some(surfaces) => surfaces[factor].sigma(step as f64 * dt, spots[factor]),
+                        None => request.market.vols[factor],
+                    };
                     let drift =
                         (rate - request.market.dividend_yields[factor] - 0.5 * vol * vol) * dt;
                     spots[factor] *= (drift + vol * dt.sqrt() * shocks[factor]).exp();
@@ -144,7 +148,10 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             if knocked_out {
                 ko_funding_sum += funding;
             }
-            let hit_ki = !knocked_out && final_worst <= request.trade.knock_in_barrier;
+            // The reported leg is the standalone European down-and-in put:
+            // DF * E[(K - w_T)+ * 1{w_T <= KI}], per the fixture's documented formula
+            // (no KO gate — KO affects funding/coupon, not this leg).
+            let hit_ki = final_worst <= request.trade.knock_in_barrier;
             if hit_ki {
                 ki_count += 1;
             }
@@ -228,13 +235,9 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
         },
         TransitionStats {
             transition_id: "final_fixing_eki".into(),
-            input_count: (paths as u64).saturating_sub(ko_count),
+            input_count: paths as u64,
             output_count: ki_count,
-            probability: if paths as u64 > ko_count {
-                ki_count as f64 / (paths as u64 - ko_count) as f64
-            } else {
-                0.0
-            },
+            probability: ki_probability,
             mean_payoff: if ki_count == 0 {
                 0.0
             } else {
@@ -277,10 +280,10 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
         LedgerEntry {
             transition_id: "final_fixing_eki_put".into(),
             condition: format!(
-                "surviving paths with worst_final <= {:.6}; put strike {:.6}",
+                "paths with worst_final <= {:.6}; put strike {:.6}",
                 request.trade.knock_in_barrier, request.trade.strike
             ),
-            population_before: paths as u64 - ko_count,
+            population_before: paths as u64,
             population_after: ki_count,
             pv_impact: -mean_put,
             delta_impact: 0.0,
