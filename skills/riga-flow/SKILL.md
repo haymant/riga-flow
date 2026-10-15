@@ -19,6 +19,7 @@ skills/riga-flow/
     dep_hygiene.sh             # per-crate dependency allowlist + no-UI gate
     test_backend_selection.sh  # Makefile GPU=auto/on/off selection tests
     analyse_pricing.py         # block-by-block pricing + sensitivity analysis
+    check_mcp_parity.py        # stdio vs Streamable HTTP parity (price_put)
 ```
 
 ## Building and testing

@@ -4,12 +4,14 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
     model::{
-        CallToolResult, Implementation, ListResourcesResult, PaginatedRequestParams, PromptMessage,
-        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-        ResourceContents, Role, ServerCapabilities, ServerConfig,
+        CallToolResult, CancelTaskParams, GetTaskParams, GetTaskResult, Implementation,
+        ListResourcesResult, PaginatedRequestParams, PromptMessage, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role,
+        ServerCapabilities, ServerConfig, UpdateTaskParams,
     },
     prompt, prompt_handler, prompt_router, schemars,
     service::RequestContext,
+    task_manager::TaskManager,
     tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -31,12 +33,14 @@ const DEFAULT_FIXTURE_RELATIVE_PATH: &str = "../../docs/fixture/termsheet1.json"
 #[derive(Clone)]
 struct RigaMcp {
     default_fixture_path: PathBuf,
+    tasks: TaskManager,
 }
 
 impl RigaMcp {
     fn new(default_fixture_path: PathBuf) -> Self {
         Self {
             default_fixture_path,
+            tasks: TaskManager::new(),
         }
     }
 }
@@ -736,6 +740,7 @@ impl ServerHandler for RigaMcp {
             .enable_tools()
             .enable_prompts()
             .enable_resources()
+            .enable_tasks()
             .build();
         let mut server = Implementation::default();
         server.name = "riga-mcp".to_string();
@@ -762,6 +767,37 @@ impl ServerHandler for RigaMcp {
     ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_
     {
         std::future::ready(self.read_resource_value(&request.uri))
+    }
+
+    fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<GetTaskResult, ErrorData>> + Send + '_ {
+        std::future::ready(
+            self.tasks
+                .get_task(&request.task_id)
+                .map(GetTaskResult::new),
+        )
+    }
+
+    fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
+        std::future::ready(
+            self.tasks
+                .update_task(&request.task_id, request.input_responses),
+        )
+    }
+
+    fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
+        std::future::ready(self.tasks.cancel_task(&request.task_id))
     }
 }
 
@@ -1639,6 +1675,17 @@ mod tests {
                 .all(|tool| tool.input_schema.get("type").is_some()),
             "every tool must declare an input schema"
         );
+    }
+
+    #[test]
+    fn server_advertises_tools_resources_prompts_and_tasks() {
+        let server = RigaMcp::new(default_fixture_path());
+        let info = server.get_info();
+        assert!(info.capabilities.tools.is_some());
+        assert!(info.capabilities.resources.is_some());
+        assert!(info.capabilities.prompts.is_some());
+        // Unknown task ids surface a structured error through the manager.
+        assert!(server.tasks.get_task("does-not-exist").is_err());
     }
 
     #[test]

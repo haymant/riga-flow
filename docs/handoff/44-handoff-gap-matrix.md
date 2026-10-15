@@ -115,6 +115,16 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
 2. Deepen a few tools: `build_cashflows` per-period timeline (currently per-path aggregate);
    `execution_events` streaming event tape (currently the net snapshot); `root_cause` change-log
    correlation (needs a persisted run history). `valuation_explain` base-vs-current is done.
-3. Versioned JSON-Schema snapshot of tool names/shapes (tool *names* are pinned by a CI test).
+3. Versioned **JSON-Schema hash** snapshot (tool names + schemas are now frozen structurally by a
+   CI test; a cryptographic hash snapshot remains).
+
+Resolved in the last pass:
+
+- **MCP Tasks lifecycle** — `tasks/get`, `tasks/update`, `tasks/cancel` implemented via
+  `rmcp::task_manager::TaskManager`, `.enable_tasks()` advertised (SEP-2663). Cooperative
+  progress (`TaskContext::set_status_message`) and cancellation (`is_cancel_requested`) are
+  available to task bodies; client-driven task creation follows the extension flow.
+- **stdio ↔ HTTP parity** — `skills/riga-flow/scripts/check_mcp_parity.py` runs the same
+  `price_put` over both transports and asserts identical payloads (**PASS**).
 
 Everything else in the handoff is served by a working `riga-mcp` tool, resource, or prompt.
