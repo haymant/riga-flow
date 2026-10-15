@@ -16,6 +16,10 @@ pub mod note;
 pub mod pathcube;
 pub mod payoff;
 pub mod simd;
+
+/// Re-exported so adapters can build the correlation Cholesky without a direct
+/// dependency on `riga-market`.
+pub use riga_market;
 /// Optional local-volatility model inputs.
 ///
 /// When present on a [`PriceRequest`], the engine propagates each factor under

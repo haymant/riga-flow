@@ -22,4 +22,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Per-crate dependency allowlist + no-ui
-        run: ./scripts/dep_hygiene.sh
+        run: ./skills/riga-flow/scripts/dep_hygiene.sh

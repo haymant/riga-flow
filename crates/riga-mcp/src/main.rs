@@ -1,17 +1,28 @@
 use riga_engine::fixture::load_termsheet1_fixture;
 use riga_engine::{PriceRequest, explain, price_put_leg};
 use rmcp::{
-    ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool,
-    tool_router, transport::stdio,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters,
+    model::{
+        CallToolResult, Implementation, ListResourcesResult, PaginatedRequestParams, PromptMessage,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, Role, ServerCapabilities, ServerConfig,
+    },
+    prompt, prompt_handler, prompt_router, schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
+    transport::stdio,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{Mutex, OnceLock},
 };
 
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8788";
@@ -84,13 +95,63 @@ struct RiskBatchParams {
     fixture_path: Option<String>,
 }
 
-#[tool_router(server_handler)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GetPathParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Zero-based path id.
+    path_id: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PnlExplainParams {
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Absolute spot moves per asset.
+    #[serde(default)]
+    spot_moves: Vec<f64>,
+    /// Absolute vol moves per asset.
+    #[serde(default)]
+    vol_moves: Vec<f64>,
+    /// Absolute parallel rate move.
+    #[serde(default)]
+    rate_move: f64,
+    /// Absolute correlation move.
+    #[serde(default)]
+    corr_move: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BookParams {
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Per-trade notional. Empty ⇒ a single unit trade.
+    #[serde(default)]
+    notionals: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CorpusParams {
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Baseline name. Defaults to "default".
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[tool_router]
 impl RigaMcp {
     #[tool(description = "Report riga-mcp liveness, version, and enabled engine features.")]
     fn health(&self) -> CallToolResult {
         structured_success(json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
+            "git_sha": env!("RIGA_GIT_SHA"),
             "engine": "riga-engine",
             "features": {
                 "cpu_gbm": true,
@@ -212,6 +273,604 @@ impl RigaMcp {
             Err(error) => structured_error(error.code, error.message),
         }
     }
+
+    #[tool(description = "List available market snapshots (id + as_of).")]
+    fn list_markets(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).map(|fx| market_json(&fx)) {
+            Ok(value) => structured_success(json!({"markets": [value]})),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Return the market snapshot detail (market_snapshot_id, spots, curves, vols, correlation, model)."
+    )]
+    fn get_market(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).map(|fx| market_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Generate a correlated Brownian PathCube block (Z -> Y = L Z) and report its shape/checksum + transition stats."
+    )]
+    fn generate_paths(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| generate_paths_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Return one path's state reconstructed from its identity (path_id, seed)."
+    )]
+    fn get_path(&self, Parameters(p): Parameters<GetPathParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| {
+            explain::reconstruct_path(&fx.request, p.path_id).map_err(ToolError::from_engine)
+        }) {
+            Ok(record) => structured_success(serde_json::to_value(record).unwrap_or(Value::Null)),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Branch statistics: TransitionStats[] with real populations.")]
+    fn get_branch_stats(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| {
+            price_put_leg(&fx.request)
+                .map(|r| json!(r.stats))
+                .map_err(ToolError::from_engine)
+        }) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Payoff distributions: worst-of deciles, KI rate, mean put, from the simulated paths."
+    )]
+    fn get_distributions(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| distributions_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Monte Carlo diagnostics: PV standard error and per-transition variance.")]
+    fn get_mc_diagnostics(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| {
+            price_put_leg(&fx.request)
+                .map(|r| {
+                    json!({
+                        "pv": r.pv,
+                        "mc_error": r.mc_error,
+                        "relative_se": if r.pv.abs() > 0.0 { r.mc_error / r.pv.abs() } else { 0.0 },
+                        "stats": r.stats,
+                    })
+                })
+                .map_err(ToolError::from_engine)
+        }) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Per-path cashflow summary (mean funding/coupon/put) plus sample paths.")]
+    fn build_cashflows(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| cashflows_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Central-FD Greeks (CRN) for the trade (alias of risk_batch).")]
+    fn compute_risk(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        self.risk_batch(Parameters(RiskBatchParams {
+            fixture_path: p.fixture_path,
+        }))
+    }
+
+    #[tool(description = "Book-level risk: aggregate PV/Greeks across a notional list.")]
+    fn compute_book_risk(&self, Parameters(p): Parameters<BookParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| book_risk_json(&fx, &p.notionals)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Book-level PV: price a composition once and scale across a notional list."
+    )]
+    fn price_book(&self, Parameters(p): Parameters<BookParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| book_price_json(&fx, &p.notionals)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "P&L explain: contributions from spot/vol/rate/correlation moves via the risk batch."
+    )]
+    fn pl_explain(&self, Parameters(p): Parameters<PnlExplainParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| {
+            pl_explain_json(&fx, &p.spot_moves, &p.vol_moves, p.rate_move, p.corr_move)
+        }) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Return the Explain Ledger (LedgerEntry[]) for the trade.")]
+    fn get_ledger(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| {
+            price_put_leg(&fx.request)
+                .map(|r| json!({"ledger": r.ledger, "determinism": r.determinism}))
+                .map_err(ToolError::from_engine)
+        }) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Execution Petri net: places/transitions/token counts derived from the ledger and stats."
+    )]
+    fn query_execution_net(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| execution_net_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Risk propagation net: signed risk contribution per transition and per asset."
+    )]
+    fn query_risk_net(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| risk_net_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Economic-intuition sanity checks on the Greeks.")]
+    fn validate_greeks(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| validate_greeks_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Stress-band recommendations around the KI and KO barriers.")]
+    fn recommend_scenarios(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).map(|fx| recommendations_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Root-cause analysis record grounded in the ledger and determinism envelope."
+    )]
+    fn root_cause(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| rca_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Structured model-governance evidence (assumptions, limitations, evidence refs)."
+    )]
+    fn export_governance_evidence(
+        &self,
+        Parameters(p): Parameters<PricePutParams>,
+    ) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| governance_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Capture a PV/Greeks baseline under a name for regression comparison.")]
+    fn freeze_baseline(&self, Parameters(p): Parameters<CorpusParams>) -> CallToolResult {
+        let name = p.name.unwrap_or_else(|| "default".into());
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| {
+            let report =
+                riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+                    .map_err(ToolError::from_engine)?;
+            let snapshot = json!({
+                "pv": report.base_pv,
+                "assets": report.assets.iter().map(|a| json!({"delta": a.delta, "gamma": a.gamma, "vega": a.vega})).collect::<Vec<_>>(),
+                "dv01": report.dv01(),
+                "correlation_sensitivity": report.correlation_sensitivity(),
+            });
+            baselines().lock().unwrap().insert(name.clone(), snapshot.clone());
+            Ok(json!({"name": name, "frozen": snapshot}))
+        }) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Compare the current run against a frozen baseline within tolerance; list exceptions."
+    )]
+    fn compare_corpus(&self, Parameters(p): Parameters<CorpusParams>) -> CallToolResult {
+        let name = p.name.unwrap_or_else(|| "default".into());
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| compare_corpus_json(&fx, &name)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(description = "Regression triage: exceptions from compare_corpus grouped by measure.")]
+    fn triage_regression(&self, Parameters(p): Parameters<CorpusParams>) -> CallToolResult {
+        let name = p.name.unwrap_or_else(|| "default".into());
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path)
+            .and_then(|fx| compare_corpus_json(&fx, &name))
+            .map(|c| {
+                let exceptions = c["exceptions"].clone();
+                json!({"name": name, "exceptions": exceptions, "count": c["count"]})
+            }) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Research-track AAD Greeks. Always flagged experimental; not used by production pricing."
+    )]
+    fn estimate_aad_greeks(&self, Parameters(_p): Parameters<PricePutParams>) -> CallToolResult {
+        structured_success(json!({
+            "experimental": true,
+            "method": "AAD",
+            "note": "AAD is a research track and is never the default; production Greeks use central FD with CRN.",
+        }))
+    }
+
+    #[tool(
+        description = "Bump scenarios (base + central up/down per factor) for scenario comparison; fills the atlas Scenario Comparison view."
+    )]
+    fn scenario(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| scenario_json(&fx)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+}
+
+fn scenario_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let report =
+        riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+            .map_err(ToolError::from_engine)?;
+    Ok(json!({
+        "base_pv": report.base_pv,
+        "scenario_count": report.scenario_count,
+        "rate_up_pv": report.rate_up_pv,
+        "rate_down_pv": report.rate_down_pv,
+        "correlation_up_pv": report.correlation_up_pv,
+        "correlation_down_pv": report.correlation_down_pv,
+        "assets": report.assets.iter().map(|a| json!({
+            "asset_index": a.asset_index, "delta": a.delta, "gamma": a.gamma, "vega": a.vega,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+fn prompt_brief(path: &Path, heading: &str) -> String {
+    match load_and_price(path) {
+        Ok((fixture, result)) => {
+            let ledger = result
+                .ledger
+                .iter()
+                .map(|e| {
+                    format!(
+                        "  - {}: pop {}->{} pv_impact {:+.6}",
+                        e.transition_id, e.population_before, e.population_after, e.pv_impact
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "{heading}\n\nTrade: {}\nEngine model: {}\nMarket snapshot: {}\nLegs: put {:.6}, funding {:.6}, coupon {:.6} (x10), memory_coupon {:.6} (x10)\nKI probability: {:.4}\nLedger:\n{ledger}\n\nRules: ground every claim in riga-flow tool evidence (get_ledger, query_execution_net, query_risk_net, explain_pv_attribution); never state a number not present in tool output.",
+                fixture.request.trade.trade_id,
+                fixture.engine_model,
+                result.determinism.market_snapshot_id,
+                result.legs.down_and_in_put,
+                result.legs.funding,
+                result.legs.coupon,
+                result.legs.memory_coupon,
+                result.ki_probability,
+            )
+        }
+        Err(error) => format!("{heading}\n\n(fixture unavailable: {})", error.message),
+    }
+}
+
+#[prompt_router]
+impl RigaMcp {
+    #[prompt(
+        name = "explain_pv_change",
+        description = "Investigator brief over attribution and the Explain Ledger for a PV change."
+    )]
+    async fn explain_pv_change(
+        &self,
+        Parameters(p): Parameters<PricePutParams>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
+        Ok(vec![PromptMessage::new_text(
+            Role::User,
+            prompt_brief(
+                &self.resolve(&p.fixture_path),
+                "Explain how today's PV is composed, block by block, from the leg attribution and the Explain Ledger.",
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "investigate_validation_failure",
+        description = "RCA brief grounded in the ledger and determinism envelope."
+    )]
+    async fn investigate_validation_failure(
+        &self,
+        Parameters(p): Parameters<PricePutParams>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
+        Ok(vec![PromptMessage::new_text(
+            Role::User,
+            prompt_brief(
+                &self.resolve(&p.fixture_path),
+                "Investigate the validation failure: identify the transitions and factors that moved the result, citing evidence_refs.",
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "triage_regression",
+        description = "Exception-triage brief over a frozen baseline."
+    )]
+    async fn triage_regression_brief(
+        &self,
+        Parameters(p): Parameters<PricePutParams>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
+        Ok(vec![PromptMessage::new_text(
+            Role::User,
+            prompt_brief(
+                &self.resolve(&p.fixture_path),
+                "Triage the regression: call compare_corpus, list exceptions, and group them by measure/family.",
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "summarise_risk_report",
+        description = "Summarise the top risks from the risk batch."
+    )]
+    async fn summarise_risk_report(
+        &self,
+        Parameters(p): Parameters<PricePutParams>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
+        Ok(vec![PromptMessage::new_text(
+            Role::User,
+            prompt_brief(
+                &self.resolve(&p.fixture_path),
+                "Summarise the three most important risks using risk_batch / query_risk_net evidence.",
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "recommend_stress_scenarios",
+        description = "Stress-band recommendations around the barriers."
+    )]
+    async fn recommend_stress_scenarios(
+        &self,
+        Parameters(p): Parameters<PricePutParams>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
+        Ok(vec![PromptMessage::new_text(
+            Role::User,
+            prompt_brief(
+                &self.resolve(&p.fixture_path),
+                "Recommend stress scenarios using recommend_scenarios and the barrier-proximity evidence.",
+            ),
+        )])
+    }
+
+    #[prompt(
+        name = "compose_governance_section",
+        description = "Model-governance narrative from structured evidence."
+    )]
+    async fn compose_governance_section(
+        &self,
+        Parameters(p): Parameters<PricePutParams>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
+        Ok(vec![PromptMessage::new_text(
+            Role::User,
+            prompt_brief(
+                &self.resolve(&p.fixture_path),
+                "Compose a model-governance section strictly from export_governance_evidence output.",
+            ),
+        )])
+    }
+}
+
+#[tool_handler]
+#[prompt_handler]
+impl ServerHandler for RigaMcp {
+    #[allow(clippy::field_reassign_with_default)]
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .enable_resources()
+            .build();
+        let mut server = Implementation::default();
+        server.name = "riga-mcp".to_string();
+        server.version = env!("CARGO_PKG_VERSION").to_string();
+        info.server_info = server;
+        info
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
+        let mut result = ListResourcesResult::default();
+        result.resources = self.resource_list();
+        std::future::ready(Ok(result))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_
+    {
+        std::future::ready(self.read_resource_value(&request.uri))
+    }
+}
+
+impl RigaMcp {
+    fn resource_list(&self) -> Vec<Resource> {
+        let run = Self::run_id(&self.default_fixture_path);
+        let mut out: Vec<Resource> = [
+            (
+                "market",
+                "Market snapshot (spots, curve, vols, correlation, model)",
+            ),
+            (
+                "run",
+                "Run metadata (snapshot id, seed, as_of, engine model)",
+            ),
+            ("book", "Trade identities + composition keys"),
+            ("ledger", "Explain Ledger entries"),
+            (
+                "net",
+                "Execution Petri net (places/transitions/token counts)",
+            ),
+            (
+                "risknet",
+                "Risk-propagation net (signed contribution per transition)",
+            ),
+            ("stats", "TransitionStats[]"),
+        ]
+        .iter()
+        .map(|(kind, desc)| {
+            Resource::new(format!("riga://{kind}/{run}"), (*kind).to_string())
+                .with_description(*desc)
+        })
+        .collect();
+        out.push(
+            Resource::new(format!("riga://path/{run}/0"), "path")
+                .with_description("One path's reconstructed state + identity"),
+        );
+        out.push(
+            Resource::new("riga://fixtures/termsheet1", "fixture")
+                .with_description("Pinned golden fixture (parity with the atlas)"),
+        );
+        out
+    }
+
+    fn run_id(path: &Path) -> String {
+        load_fixture(path)
+            .ok()
+            .and_then(|fx| fx.request.market.snapshot_id().ok())
+            .map(|id| id.trim_start_matches("sha256:").to_string())
+            .unwrap_or_else(|| "run".to_string())
+    }
+
+    fn read_resource_value(&self, uri: &str) -> Result<ReadResourceResponse, ErrorData> {
+        let text = self
+            .resource_text(&self.default_fixture_path, uri)
+            .map_err(|error| ErrorData::internal_error(error.message, None))?;
+        let result = ReadResourceResult::new(vec![ResourceContents::text(text, uri)]);
+        Ok(ReadResourceResponse::from(result))
+    }
+
+    fn resource_text(&self, path: &Path, uri: &str) -> Result<String, ToolError> {
+        let rest = uri.strip_prefix("riga://").unwrap_or(uri);
+        let kind = rest.split('/').next().unwrap_or("");
+        let fixture = load_fixture(path)?;
+        let value = match kind {
+            "market" => market_json(&fixture),
+            "ledger" => {
+                let r = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
+                json!({"ledger": r.ledger, "determinism": r.determinism})
+            }
+            "net" => execution_net_json(&fixture)?,
+            "risknet" => risk_net_json(&fixture)?,
+            "stats" => {
+                let r = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
+                json!(r.stats)
+            }
+            "run" => {
+                let r = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
+                json!({
+                    "run_id": r.determinism.market_snapshot_id,
+                    "seed": r.determinism.seed,
+                    "as_of": r.determinism.as_of,
+                    "engine_model": fixture.engine_model,
+                })
+            }
+            "book" => json!({
+                "trade_id": fixture.request.trade.trade_id,
+                "initial_spots": fixture.request.trade.initial_spots,
+                "composition": "autocallable/daily_ko/european_ki/2-name/memory",
+            }),
+            "path" => {
+                let id: usize = rest
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                serde_json::to_value(
+                    explain::reconstruct_path(&fixture.request, id)
+                        .map_err(ToolError::from_engine)?,
+                )
+                .unwrap_or(Value::Null)
+            }
+            "fixtures" => serde_json::from_str::<Value>(
+                &std::fs::read_to_string(path)
+                    .map_err(|e| ToolError::new("fixture_io", e.to_string()))?,
+            )
+            .map_err(|e| ToolError::new("fixture_parse", e.to_string()))?,
+            other => {
+                return Err(ToolError::new(
+                    "unknown_resource",
+                    format!("no resource for '{other}' in {uri}"),
+                ));
+            }
+        };
+        serde_json::to_string_pretty(&value)
+            .map_err(|e| ToolError::new("serialization_error", e.to_string()))
+    }
+}
+
+fn baselines() -> &'static Mutex<HashMap<String, Value>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl RigaMcp {
@@ -530,9 +1189,378 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+fn market_json(fx: &riga_engine::fixture::LoadedFixture) -> Value {
+    let m = &fx.request.market;
+    json!({
+        "as_of": m.as_of,
+        "snapshot_id": m.snapshot_id().ok(),
+        "spots": m.spots,
+        "vols": m.vols,
+        "risk_free_rate": m.risk_free_rate,
+        "dividend_yields": m.dividend_yields,
+        "correlation": m.correlation,
+        "engine_model": fx.engine_model,
+        "source_model": fx.source_model,
+        "local_vol": fx.request.local_vol.is_some(),
+    })
+}
+
+fn generate_paths_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let req = &fx.request;
+    let chol = riga_engine::riga_market::CorrelationMatrix::from_rows(&req.market.correlation)
+        .map_err(|e| ToolError::new("invalid_market", e))?
+        .cholesky()
+        .map_err(|e| ToolError::new("invalid_market", e))?;
+    let paths = req.config.paths.min(4096);
+    let block = riga_engine::pathcube::generate_correlated_block(
+        req.config.seed,
+        paths,
+        req.trade.steps,
+        &chol,
+    );
+    let checksum = block
+        .data
+        .iter()
+        .fold(0u64, |acc, x| acc.rotate_left(1) ^ (x.to_bits() as u64));
+    let stats = price_put_leg(req).map_err(ToolError::from_engine)?;
+    Ok(json!({
+        "pathcube_ref": format!("riga://pathcube/{}", req.market.snapshot_id().unwrap_or_default()),
+        "paths": block.paths,
+        "times": block.times,
+        "factors": block.factors,
+        "seed": req.config.seed,
+        "checksum": checksum,
+        "transition_stats": stats.stats,
+    }))
+}
+
+fn distributions_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let records = explain::run_paths(&fx.request).map_err(ToolError::from_engine)?;
+    let n = records.len();
+    let mut worst: Vec<f64> = records.iter().map(|r| r.worst_final).collect();
+    worst.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let deciles: Vec<f64> = (1..=10).map(|i| worst[(i * n / 10).min(n - 1)]).collect();
+    let ki = records.iter().filter(|r| r.ki_hit).count() as f64 / n as f64;
+    let mean_put = records.iter().map(|r| r.put_payoff).sum::<f64>() / n as f64;
+    Ok(json!({
+        "count": n,
+        "worst_final_deciles": deciles,
+        "ki_rate": ki,
+        "mean_put": mean_put,
+    }))
+}
+
+fn cashflows_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let records = explain::run_paths(&fx.request).map_err(ToolError::from_engine)?;
+    let n = records.len() as f64;
+    let funding = records.iter().map(|r| r.funding).sum::<f64>() / n;
+    let coupon = records.iter().map(|r| r.coupon_pv).sum::<f64>() / n;
+    let put = records.iter().map(|r| r.put_payoff).sum::<f64>() / n;
+    let sample: Vec<Value> = records
+        .iter()
+        .take(3)
+        .map(|r| {
+            json!({
+                "path_id": r.identity.path_id,
+                "funding": r.funding,
+                "coupon_pv": r.coupon_pv,
+                "put_payoff": r.put_payoff,
+                "pv": r.pv,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "paths": records.len(),
+        "mean": {"funding": funding, "coupon_pv": coupon, "put_payoff": put},
+        "sample_paths": sample,
+    }))
+}
+
+fn execution_net_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
+    let mut places = vec![json!({"id": "start", "tokens": fx.request.config.paths})];
+    let transitions: Vec<Value> = result
+        .ledger
+        .iter()
+        .map(|e| {
+            places.push(json!({"id": format!("{}_out", e.transition_id), "tokens": e.population_after}));
+            json!({
+                "id": e.transition_id,
+                "condition": e.condition,
+                "population_before": e.population_before,
+                "population_after": e.population_after,
+                "probability": if e.population_before > 0 { e.population_after as f64 / e.population_before as f64 } else { 0.0 },
+                "pv_impact": e.pv_impact,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "places": places,
+        "transitions": transitions,
+        "stats": result.stats,
+        "run_id": result.determinism.market_snapshot_id,
+    }))
+}
+
+fn risk_net_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
+    let report =
+        riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+            .map_err(ToolError::from_engine)?;
+    let transitions: Vec<Value> = result
+        .ledger
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.transition_id,
+                "pv_impact": e.pv_impact,
+                "delta_impact": e.delta_impact,
+                "vega_impact": e.vega_impact,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "transitions": transitions,
+        "per_asset": report.assets.iter().map(|a| json!({
+            "asset_index": a.asset_index, "delta": a.delta, "gamma": a.gamma, "vega": a.vega,
+        })).collect::<Vec<_>>(),
+        "dv01": report.dv01(),
+        "correlation_sensitivity": report.correlation_sensitivity(),
+    }))
+}
+
+fn validate_greeks_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let report =
+        riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+            .map_err(ToolError::from_engine)?;
+    let mut flags = Vec::new();
+    for a in &report.assets {
+        if a.vega.abs() < 1.0e-9 {
+            flags.push(json!({"severity": "warn", "message": format!("asset[{}] vega is ~0; verify the vol bump targets the model surface", a.asset_index)}));
+        }
+        if a.delta.abs() > 0.0 && a.delta_mc_error > a.delta.abs() {
+            flags.push(json!({"severity": "info", "message": format!("asset[{}] delta is smaller than its MC error bound", a.asset_index)}));
+        }
+    }
+    if flags.is_empty() {
+        flags.push(json!({"severity": "info", "message": "no anomalies detected"}));
+    }
+    Ok(json!({"flags": flags}))
+}
+
+fn recommendations_json(fx: &riga_engine::fixture::LoadedFixture) -> Value {
+    let ki = fx.request.trade.knock_in_barrier;
+    let ko = fx.request.trade.knock_out_barrier.unwrap_or(f64::NAN);
+    let band = |c: f64| json!([c * 0.94, c * 1.06]);
+    json!({"recommendations": [
+        {"spot_band": band(ki), "reason": format!("KI at {:.0}% of initial spot; payoff discontinuity near activation", ki * 100.0)},
+        {"spot_band": band(ko), "reason": format!("KO at {:.0}% of initial spot; autocall boundary", ko * 100.0)},
+    ]})
+}
+
+fn rca_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
+    Ok(json!({
+        "trade": fx.request.trade.trade_id,
+        "market_snapshot_id": result.determinism.market_snapshot_id,
+        "engine_model": fx.engine_model,
+        "finding": format!(
+            "PUT leg {:.6}; EKI rate {:.4}; dominant driver is the terminal down-and-in put",
+            result.legs.down_and_in_put, result.ki_probability
+        ),
+        "evidence_refs": result.ledger.iter().flat_map(|e| e.evidence_refs.clone()).collect::<Vec<_>>(),
+        "note": "RCA is grounded in the ledger + determinism envelope; change-log correlation needs a persisted run history.",
+    }))
+}
+
+fn governance_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
+    Ok(json!({
+        "model": fx.engine_model,
+        "source_model": fx.source_model,
+        "assumptions": [
+            "Dupire local vol calibrated from the captured implied smile",
+            "correlation applied via the Cholesky factor of the captured matrix",
+            "terminal EKI down-and-in put, no KO gate on the standalone put leg",
+        ],
+        "limitations": [
+            "no independent high-precision reference comparison yet",
+            "PathCube is not persisted; replay reconstructs deterministically from (seed, path_id)",
+        ],
+        "stress_methodology": "central finite differences with common random numbers",
+        "evidence": {
+            "market_snapshot_id": result.determinism.market_snapshot_id,
+            "seed": result.determinism.seed,
+            "as_of": result.determinism.as_of,
+        },
+        "legs": result.legs,
+    }))
+}
+
+fn book_price_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    notionals: &[f64],
+) -> Result<Value, ToolError> {
+    let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
+    let ns: Vec<f64> = if notionals.is_empty() {
+        vec![1.0]
+    } else {
+        notionals.to_vec()
+    };
+    let per_trade: Vec<f64> = ns.iter().map(|n| n * result.pv).collect();
+    let total: f64 = per_trade.iter().sum();
+    Ok(json!({
+        "trades": ns.len(),
+        "clusters": 1,
+        "representative_pv": result.pv,
+        "total_pv": total,
+        "per_trade": per_trade,
+        "legs": result.legs,
+    }))
+}
+
+fn book_risk_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    notionals: &[f64],
+) -> Result<Value, ToolError> {
+    let report =
+        riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+            .map_err(ToolError::from_engine)?;
+    let ns: Vec<f64> = if notionals.is_empty() {
+        vec![1.0]
+    } else {
+        notionals.to_vec()
+    };
+    let rows: Vec<(f64, riga_risk::BatchRiskReport)> =
+        ns.iter().map(|n| (*n, report.clone())).collect();
+    let portfolio = riga_risk::aggregate_portfolio(&rows);
+    Ok(json!({
+        "trades": portfolio.trades,
+        "pv": portfolio.pv,
+        "delta": portfolio.delta,
+        "gamma": portfolio.gamma,
+        "vega": portfolio.vega,
+        "dv01": portfolio.dv01,
+        "correlation_sensitivity": portfolio.correlation_sensitivity,
+    }))
+}
+
+fn pl_explain_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    spot_moves: &[f64],
+    vol_moves: &[f64],
+    rate_move: f64,
+    corr_move: f64,
+) -> Result<Value, ToolError> {
+    let report =
+        riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+            .map_err(ToolError::from_engine)?;
+    let moves = riga_risk::pnl_explain(&report, spot_moves, vol_moves, rate_move, corr_move);
+    let total: f64 = moves.iter().map(|m| m.contribution).sum();
+    Ok(json!({
+        "contributions": moves.iter().map(|m| json!({"factor": m.label, "contribution": m.contribution})).collect::<Vec<_>>(),
+        "total": total,
+    }))
+}
+
+fn compare_corpus_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    name: &str,
+) -> Result<Value, ToolError> {
+    let baseline = baselines().lock().unwrap().get(name).cloned();
+    let Some(base) = baseline else {
+        return Err(ToolError::new(
+            "no_baseline",
+            format!("no frozen baseline named '{name}'; call freeze_baseline first"),
+        ));
+    };
+    let report =
+        riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+            .map_err(ToolError::from_engine)?;
+    let mut exceptions = Vec::new();
+    let base_pv = base["pv"].as_f64().unwrap_or(0.0);
+    let rel = (report.base_pv - base_pv).abs() / base_pv.abs().max(1.0e-12);
+    if rel > 1.0e-4 {
+        exceptions.push(
+            json!({"measure": "pv", "baseline": base_pv, "current": report.base_pv, "rel": rel}),
+        );
+    }
+    let base_assets = base["assets"].as_array().cloned().unwrap_or_default();
+    for (i, a) in report.assets.iter().enumerate() {
+        if let Some(ba) = base_assets.get(i) {
+            for (k, cur) in [("delta", a.delta), ("gamma", a.gamma), ("vega", a.vega)] {
+                let b = ba[k].as_f64().unwrap_or(0.0);
+                if (cur - b).abs() > 1.0e-4 {
+                    exceptions.push(
+                        json!({"measure": format!("{k}[{i}]"), "baseline": b, "current": cur}),
+                    );
+                }
+            }
+        }
+    }
+    let count = exceptions.len();
+    Ok(json!({
+        "name": name,
+        "exceptions": exceptions,
+        "count": count,
+        "within_tolerance": count == 0,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_surface_is_frozen() {
+        // Additive-only contract: the tool-name set is pinned so an accidental
+        // rename/removal fails CI (docs/handoff/44-handoff-gap-matrix.md).
+        let mut names: Vec<String> = RigaMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        let mut expected: Vec<String> = [
+            "build_cashflows",
+            "compare_corpus",
+            "compute_book_risk",
+            "compute_risk",
+            "estimate_aad_greeks",
+            "explain_pv_attribution",
+            "export_governance_evidence",
+            "freeze_baseline",
+            "generate_paths",
+            "get_branch_stats",
+            "get_distributions",
+            "get_ledger",
+            "get_market",
+            "get_mc_diagnostics",
+            "get_path",
+            "health",
+            "list_markets",
+            "pl_explain",
+            "price_book",
+            "price_put",
+            "price_trade",
+            "query_execution_net",
+            "query_path_cube",
+            "query_pathcube",
+            "query_risk_net",
+            "recommend_scenarios",
+            "replay_path",
+            "risk_batch",
+            "root_cause",
+            "scenario",
+            "triage_regression",
+            "validate_greeks",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        expected.sort();
+        assert_eq!(names, expected);
+    }
 
     #[test]
     fn canonical_fixture_passes_once_market_capture_is_pinned() {

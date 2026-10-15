@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 pub struct PathIdentity {
     pub path_id: usize,
     pub rng_seed: u64,
+    /// Reserved for Sobol/QMC path identity; `0` until QMC is implemented.
+    #[serde(default)]
+    pub sobol_index: u64,
 }
 
 /// The economic state of one simulated path.
@@ -187,6 +190,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                 identity: PathIdentity {
                     path_id,
                     rng_seed: seed,
+                    sobol_index: 0,
                 },
                 worst_final: final_worst,
                 knocked_out,

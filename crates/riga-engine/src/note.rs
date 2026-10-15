@@ -278,7 +278,7 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             evidence_refs: evidence.clone(),
         },
         LedgerEntry {
-            transition_id: "final_fixing_eki_put".into(),
+            transition_id: "final_fixing_eki".into(),
             condition: format!(
                 "terminal worst <= {:.6} and no prior autocall; put strike {:.6}",
                 request.trade.knock_in_barrier, request.trade.strike
@@ -423,7 +423,7 @@ mod tests {
         let put_ledger = result
             .ledger
             .iter()
-            .find(|entry| entry.transition_id == "final_fixing_eki_put")
+            .find(|entry| entry.transition_id == "final_fixing_eki")
             .unwrap();
         assert_eq!(put_ledger.population_before, surviving_paths);
         assert_eq!(put_ledger.population_after, put_eligible_paths);

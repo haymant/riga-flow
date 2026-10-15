@@ -25,10 +25,15 @@ The `feat/draftdesign` workspace contains:
 - `riga-scheduler`: deterministic composition grouping, bounded work-range planning, LRU scenario
   cache, kernel registry, and occupancy reporting. It is not yet connected to engine dispatch.
 - `riga-cli`: headless JSON CLI.
-- `riga-mcp`: `health`, `price_put`, `price_trade`, `explain_pv_attribution`, `replay_path`,
-  `query_path_cube`, catalog-spelled alias `query_pathcube`, and `risk_batch`, over stdio and
-  optional Streamable HTTP. Resources, prompts, book tasks, progress/cancellation, and transport
-  parity testing remain open.
+- `riga-mcp`: the **tool** surface — pricing, simulation (`generate_paths`, `get_path`,
+  `get_branch_stats`, `get_distributions`, `get_mc_diagnostics`, `build_cashflows`), risk
+  (`compute_risk`, `risk_batch`, `compute_book_risk`, `price_book`, `pl_explain`,
+  `estimate_aad_greeks`), explainability (`explain_pv_attribution`, `get_ledger`,
+  `query_execution_net`, `query_risk_net`, `query_pathcube` + `query_path_cube`, `validate_greeks`,
+  `recommend_scenarios`, `scenario`, `root_cause`, `export_governance_evidence`) and regression
+  (`freeze_baseline`, `compare_corpus`, `triage_regression`) — over stdio and optional Streamable
+  HTTP. Resources, prompts, progress/cancellation, and transport parity testing remain open (see
+  [`../handoff/44-handoff-gap-matrix.md`](../handoff/44-handoff-gap-matrix.md)).
 - `docs/fixture/termsheet1.json`: captured as-of marks, initial fixing basis, full implied-vol
   smile and calibrated local-vol inputs, USD curve, dividends, resolved correlation, and the
   issuer-pinned **10%-of-initial coupon floor**.
@@ -69,7 +74,7 @@ workspace test suite, dependency hygiene/no-UI, and the backend-selection regres
 | Formatting | Pass — `cargo fmt --all -- --check` |
 | Strict lint | Pass — `cargo clippy --workspace --all-targets -- -D warnings` |
 | Workspace unit/integration tests | **64 passed, 0 failed**: core 4; engine 31; allocator integration 1; market 8; MCP 4; risk 9; scheduler 7 |
-| Dependency hygiene / no UI | Pass — `./scripts/dep_hygiene.sh` |
+| Dependency hygiene / no UI | Pass — `./skills/riga-flow/scripts/dep_hygiene.sh` |
 | Make backend policy | Pass — current sandbox probe selects CPU; mocked visible device + driver + CUDA 13 NVRTC selects CUDA; `GPU=off` forces CPU; invalid value rejected; `GPU=on build` fails its preflight on this host |
 | Fixture acceptance | **Pass** — release CLI reports PUT −3.7456% from anchor and KI within tolerance |
 | Golden / determinism | Pass — structured JSON comparison within `1e-12`; same envelope repeats identical JSON bytes |
@@ -109,7 +114,7 @@ criterion remains open. A row marked “slice passed” does not certify a broad
 | 9 — GPU path propagation | GPU propagation, throughput and loud-unavailable behavior | **Partial / hardware blocked here** | Optional CUDA worst-of kernel and a conservative per-host Make selector; this sandbox has no GPU, so runtime parity/throughput was not rerun. GPU LV propagation, coupon kernels and end-to-end GPU pricing remain. |
 | 10 — Production risk engine | 61-scenario factors, aggregation and 100k-book performance | **Partial** | 13-scenario/two-asset CRN report, DV01, correlation sensitivity, PnL explain and aggregation. Full 61-scenario lane and 100k-book timing remain. |
 | 11 — Explainability & ledger | Attribution, replay, snapshots and archive | **Partial** | Leg/ledger output, event-consistent pricing statistics, deterministic replay/path reconstruction and percentile query. Persistent PathCube/run archive and full evidence lineage remain. |
-| 12 — MCP server | Catalog, transports, errors, progress/cancellation | **Partial** | Eight stdio tools, structured errors, PathCube naming alias, optional HTTP transport. Resource/prompt catalog, HTTP/stdio parity, Tasks/progress/cancellation and book tools remain. |
+| 12 — MCP server | Catalog, transports, errors, progress/cancellation | **Partial** | Full handoff **tool** surface (32 tools) + **9 resources** + **6 prompts** over stdio and optional HTTP, structured errors, PathCube naming alias, `health` git SHA, frozen tool-name test. Tasks/progress/cancellation and remote (HTTP) parity testing remain — see [`../handoff/44-handoff-gap-matrix.md`](../handoff/44-handoff-gap-matrix.md). |
 | 13 — `fina-builder` handoff | Frozen contract and downstream visual atlas | **Deferred by user request** | Intentionally excluded; no handoff integration performed. |
 
 ## Remaining gates

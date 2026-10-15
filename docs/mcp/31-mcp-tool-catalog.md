@@ -9,10 +9,17 @@
 `<verb>_<object>` in `snake_case`. Every tool returns the uniform error shape and, for
 pricing/risk/explain tools, the determinism envelope.
 
-The catalog below remains the normative target. The current `riga-mcp` adapter implements a
-subset (`health`, `price_put`, `price_trade`, `explain_pv_attribution`, `replay_path`,
-`query_pathcube`, `query_path_cube` as an additive spelling alias, and `risk_batch`); resources,
-prompts, book tools and task progress/cancellation remain open gates in
+The catalog below remains the normative target. The current `riga-mcp` adapter implements the
+**tool** surface — pricing (`health`, `price_trade`, `price_put`), simulation (`generate_paths`,
+`get_path`, `get_branch_stats`, `get_distributions`, `get_mc_diagnostics`, `build_cashflows`),
+risk (`compute_risk`, `risk_batch`, `compute_book_risk`, `price_book`, `pl_explain`,
+`estimate_aad_greeks` flagged experimental), explainability (`explain_pv_attribution`,
+`get_ledger`, `query_execution_net`, `query_risk_net`, `query_pathcube` + `query_path_cube`,
+`validate_greeks`, `recommend_scenarios`, `scenario`, `root_cause`, `export_governance_evidence`)
+and regression (`freeze_baseline`, `compare_corpus`, `triage_regression`). It also serves the
+**resources** (§6) and **prompts** (§7) surfaces. Task/progress/cancellation and remote
+(HTTP) parity testing remain — see the handoff gap matrix,
+[`../handoff/44-handoff-gap-matrix.md`](../handoff/44-handoff-gap-matrix.md), and
 [`../plan/25-implementation-evidence.md`](../plan/25-implementation-evidence.md).
 
 ## 2. Pricing & simulation tools

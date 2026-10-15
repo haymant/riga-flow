@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Per-crate dependency allowlist + no-UI gate (Phase 0 / docs/plan/22-acceptance-criteria.md).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../../.."
 
 fail=0
 
