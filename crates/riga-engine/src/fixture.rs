@@ -388,6 +388,7 @@ pub fn load_termsheet1_fixture(path: impl AsRef<Path>) -> Result<LoadedFixture, 
             path_block_size: run["path_block_size"].as_u64().unwrap_or(4_096) as usize,
             seed: run["seed"].as_u64().unwrap_or(1_729),
             trace_level: TraceLevel::Aggregated,
+            variance_reduction: riga_core::VarianceReduction::None,
         },
         as_of: as_of.to_owned(),
     };

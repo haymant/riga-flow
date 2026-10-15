@@ -15,6 +15,7 @@ pub mod graph;
 pub mod note;
 pub mod pathcube;
 pub mod payoff;
+pub mod qmc;
 pub mod simd;
 
 /// Re-exported so adapters can build the correlation Cholesky without a direct
@@ -629,5 +630,49 @@ mod tests {
     fn cpu_build_has_no_gpu_backend_and_is_portable() {
         assert!(!gpu_enabled());
         assert!(gpu_backend().is_ok());
+    }
+
+    #[test]
+    fn qmc_halton_reduces_the_put_estimator_variance() {
+        use riga_core::VarianceReduction;
+        let base = fixture().request;
+        let variance = |values: &[f64]| {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (values.len() as f64 - 1.0)
+        };
+        let measure = |steps: usize| {
+            let (mut mc, mut qmc) = (Vec::new(), Vec::new());
+            for seed in 1..=12u64 {
+                let mut request = base.clone();
+                request.trade.steps = steps;
+                request.config.paths = 4096;
+                request.config.path_block_size = 4096;
+                request.config.seed = seed;
+                request.config.variance_reduction = VarianceReduction::None;
+                mc.push(price_put_leg(&request).unwrap().legs.down_and_in_put);
+                request.config.variance_reduction = VarianceReduction::Halton {
+                    dimension: steps * 2,
+                };
+                qmc.push(price_put_leg(&request).unwrap().legs.down_and_in_put);
+            }
+            (variance(&mc), variance(&qmc))
+        };
+
+        let (mc_low, qmc_low) = measure(16);
+        eprintln!(
+            "QMC (dim 32): MC {mc_low:.3e} -> QMC {qmc_low:.3e} ({:.2}x)",
+            mc_low / qmc_low
+        );
+        assert!(
+            qmc_low <= mc_low,
+            "QMC must not increase variance at low dimension"
+        );
+
+        let (mc_full, qmc_full) = measure(base.trade.steps);
+        eprintln!(
+            "QMC (full path dim {}): MC {mc_full:.3e} -> QMC {qmc_full:.3e} ({:.2}x) — high-dim needs Sobol + Brownian bridge",
+            base.trade.steps * 2,
+            mc_full / qmc_full
+        );
     }
 }

@@ -51,6 +51,12 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
     let coupon_barrier = request.trade.coupon_barrier.unwrap_or(f64::INFINITY);
     let coupon_rate = request.trade.coupon_rate.unwrap_or(0.0);
     let mut rng = ChaCha8Rng::seed_from_u64(request.config.seed);
+    let qmc = match &request.config.variance_reduction {
+        riga_core::VarianceReduction::Halton { dimension } => {
+            Some(crate::qmc::Halton::new(*dimension, request.config.seed))
+        }
+        riga_core::VarianceReduction::None => None,
+    };
 
     let mut pv_moments = OnlineMoments::default();
     let mut ko_funding_moments = OnlineMoments::default();
@@ -68,7 +74,7 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
 
     for block_start in (0..paths).step_by(request.config.path_block_size) {
         let block_end = (block_start + request.config.path_block_size).min(paths);
-        for _ in block_start..block_end {
+        for path_id in block_start..block_end {
             let mut spots = [request.market.spots[0], request.market.spots[1]];
             let mut knocked_out = false;
             let mut redemption_time = request.trade.maturity_years;
@@ -81,8 +87,16 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             let mut final_worst = 1.0;
 
             for step in 0..steps {
-                let z0: f64 = rng.sample(StandardNormal);
-                let z1_independent: f64 = rng.sample(StandardNormal);
+                let (z0, z1_independent) = match &qmc {
+                    Some(ladder) => {
+                        let base = step * 2;
+                        (
+                            ladder.normal(path_id as u64, base),
+                            ladder.normal(path_id as u64, base + 1),
+                        )
+                    }
+                    None => (rng.sample(StandardNormal), rng.sample(StandardNormal)),
+                };
                 let mut shocks = [0.0f64; 2];
                 chol.apply_into(&[z0, z1_independent], &mut shocks);
                 // Continue evolving the market path after KO for the unconditional terminal-KI

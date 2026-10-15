@@ -80,6 +80,24 @@ pub struct SimulationConfig {
     pub path_block_size: usize,
     pub seed: u64,
     pub trace_level: TraceLevel,
+    /// Variance-reduction scheme for path generation.
+    #[serde(default)]
+    pub variance_reduction: VarianceReduction,
+}
+
+/// Variance-reduction scheme for the Brownian increments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VarianceReduction {
+    /// Pseudo-random Monte Carlo (default).
+    #[default]
+    None,
+    /// Low-discrepancy QMC: the `n`-th point of a scrambled Halton ladder, one
+    /// dimension per `(time, factor)` increment, mapped through the inverse normal CDF.
+    Halton {
+        /// Number of QMC dimensions (= steps × factors).
+        dimension: usize,
+    },
 }
 
 impl Default for SimulationConfig {
@@ -89,6 +107,7 @@ impl Default for SimulationConfig {
             path_block_size: 4_096,
             seed: 1_729,
             trace_level: TraceLevel::Aggregated,
+            variance_reduction: VarianceReduction::None,
         }
     }
 }

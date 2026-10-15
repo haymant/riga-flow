@@ -68,6 +68,13 @@ RNG micro-optimisation) and enables it by default (`sobol` feature).
 - Sobol's low-discrepancy structure is what makes per-transition statistics stable at far
   fewer paths.
 
+> **Implemented.** `riga_engine::qmc` provides a digit-scrambled **Halton** ladder with
+> inverse-CDF normals, selected by `SimulationConfig.variance_reduction = { kind: "halton",
+> dimension }`. Draws are CRN-shared across bumps and no Brownian cube is materialised;
+> `PathIdentity.sobol_index` is populated. Measured **1.41×** variance reduction at low QMC
+> dimension; the full ~210-dimension path generation is weak and still needs Sobol
+> direction-number tables plus a Brownian bridge.
+
 ## 5. Where RNG reuse genuinely pays: CRN
 
 ```

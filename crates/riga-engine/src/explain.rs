@@ -73,6 +73,12 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
     let coupon_barrier = request.trade.coupon_barrier.unwrap_or(f64::INFINITY);
     let coupon_rate = request.trade.coupon_rate.unwrap_or(0.0);
     let mut rng = ChaCha8Rng::seed_from_u64(request.config.seed);
+    let qmc = match &request.config.variance_reduction {
+        riga_core::VarianceReduction::Halton { dimension } => {
+            Some(crate::qmc::Halton::new(*dimension, request.config.seed))
+        }
+        riga_core::VarianceReduction::None => None,
+    };
     let seed = request.config.seed;
     let mut records = Vec::with_capacity(paths);
 
@@ -91,8 +97,16 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
             let mut final_worst = 1.0;
 
             for step in 0..steps {
-                let z0: f64 = rng.sample(StandardNormal);
-                let z1_independent: f64 = rng.sample(StandardNormal);
+                let (z0, z1_independent) = match &qmc {
+                    Some(ladder) => {
+                        let base = step * 2;
+                        (
+                            ladder.normal(path_id as u64, base),
+                            ladder.normal(path_id as u64, base + 1),
+                        )
+                    }
+                    None => (rng.sample(StandardNormal), rng.sample(StandardNormal)),
+                };
                 let mut shocks = [0.0f64; 2];
                 chol.apply_into(&[z0, z1_independent], &mut shocks);
                 let note_is_active = !knocked_out;
@@ -190,7 +204,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                 identity: PathIdentity {
                     path_id,
                     rng_seed: seed,
-                    sobol_index: 0,
+                    sobol_index: if qmc.is_some() { path_id as u64 + 1 } else { 0 },
                 },
                 worst_final: final_worst,
                 knocked_out,
