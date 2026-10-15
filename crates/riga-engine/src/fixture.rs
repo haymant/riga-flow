@@ -450,7 +450,7 @@ mod tests {
         assert!((request.market.vols[1] - 0.35599).abs() < 0.002);
         assert!((request.market.risk_free_rate - 0.038825).abs() < 0.0005);
         assert_eq!(request.market.dividend_yields, vec![0.0, 0.002979]);
-        assert_eq!(request.market.correlation[0][1], 0.4041);
+        assert_eq!(request.market.correlation[0][1], 0.4593248180905);
         assert_eq!(request.trade.initial_spots, vec![239.97, 260.0]);
         assert_eq!(request.trade.strike, 0.78);
         assert_eq!(request.trade.knock_in_barrier, 0.70);

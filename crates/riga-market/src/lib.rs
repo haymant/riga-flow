@@ -20,6 +20,10 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod correlation;
+
+pub use correlation::{Cholesky, CorrelationMatrix};
+
 /// Number of points on the dense log-strike axis used for the local-vol grid.
 pub const GRID_X: usize = 96;
 /// Defensive floor on local vol (smile-spline noise).

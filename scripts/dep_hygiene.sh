@@ -27,7 +27,7 @@ check() {
 # Keep this allowlist in sync with docs/design/12-crate-layout.md §3.
 check riga-core      serde serde_json sha2 thiserror
 check riga-market    riga-core serde serde_json thiserror
-check riga-engine    riga-core riga-market rand rand_chacha rand_distr serde serde_json sha2 thiserror
+check riga-engine    riga-core riga-market rand rand_chacha rand_distr serde serde_json sha2 thiserror cudarc
 check riga-risk      riga-core riga-engine
 check riga-scheduler serde
 check riga-cli       riga-core riga-engine serde_json

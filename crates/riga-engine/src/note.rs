@@ -18,8 +18,10 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
     let periods = request.trade.coupon_periods.unwrap_or(9).max(1);
     let call_start_step = request.trade.call_start_step.unwrap_or(0);
     let dt = request.trade.maturity_years / steps as f64;
-    let rho = request.market.correlation[0][1];
-    let rho_orthogonal = (1.0 - rho * rho).sqrt();
+    let chol = riga_market::CorrelationMatrix::from_rows(&request.market.correlation)
+        .map_err(|e| RigaError::new("invalid_market", e))?
+        .cholesky()
+        .map_err(|e| RigaError::new("invalid_market", e))?;
     let rate = request.market.risk_free_rate;
     let call_barrier = request.trade.knock_out_barrier.unwrap_or(f64::INFINITY);
     let coupon_barrier = request.trade.coupon_barrier.unwrap_or(f64::INFINITY);
@@ -59,7 +61,8 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             for step in 0..steps {
                 let z0: f64 = rng.sample(StandardNormal);
                 let z1_independent: f64 = rng.sample(StandardNormal);
-                let shocks = [z0, rho * z0 + rho_orthogonal * z1_independent];
+                let mut shocks = [0.0f64; 2];
+                chol.apply_into(&[z0, z1_independent], &mut shocks);
                 // Continue consuming the fixed per-path stream after KO. This keeps the
                 // next path's shocks invariant under spot/vol bumps (CRN path identity).
                 if knocked_out {

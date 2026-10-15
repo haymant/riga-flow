@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod explain;
 pub mod fixture;
+pub mod gpu;
 pub mod graph;
 pub mod note;
+pub mod pathcube;
 pub mod payoff;
 pub mod simd;
 /// Optional local-volatility model inputs.
@@ -177,16 +179,16 @@ pub fn price_put_leg(request: &PriceRequest) -> Result<PriceResult, RigaError> {
 
 /// GPU backend availability.
 ///
-/// riga-flow ships no GPU kernel. Building with the `gpu` feature is a statement
-/// that a GPU backend is present; if it is not, the engine must fail loudly
-/// rather than silently fall back to the CPU (acceptance AC-10, invariant I-L3).
+/// With the `gpu` feature the engine initialises a CUDA device (via `cudarc`) and
+/// fails loudly if none is usable — there is no silent CPU fallback
+/// (acceptance AC-10, invariant I-L3). Without the feature this is a no-op.
 pub fn gpu_backend() -> Result<(), RigaError> {
-    if cfg!(feature = "gpu") {
-        Err(RigaError::new(
-            "gpu_unavailable",
-            "gpu feature is enabled but no GPU backend is present; refusing silent CPU fallback",
-        ))
-    } else {
+    #[cfg(feature = "gpu")]
+    {
+        gpu::ensure_available()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
         Ok(())
     }
 }
@@ -561,10 +563,15 @@ mod tests {
 
     #[test]
     #[cfg(feature = "gpu")]
-    fn gpu_build_fails_loudly_without_a_backend() {
+    fn gpu_build_reports_a_device_or_fails_loudly() {
         assert!(gpu_enabled());
-        let error = gpu_backend().unwrap_err();
-        assert_eq!(error.code, "gpu_unavailable");
+        match gpu_backend() {
+            Ok(()) => {
+                let name = gpu::device_name().expect("device name after successful init");
+                assert!(!name.is_empty());
+            }
+            Err(error) => assert_eq!(error.code, "gpu_unavailable"),
+        }
     }
 
     #[test]

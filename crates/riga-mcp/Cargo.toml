@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "Thin MCP adapter for riga-flow pricing"
 
+[features]
+gpu = ["riga-engine/gpu"]
+
 [dependencies]
 axum = "0.8"
 riga-core = { path = "../riga-core" }

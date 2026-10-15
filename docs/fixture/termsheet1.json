@@ -40,10 +40,10 @@
     "day_count": "Actual/365"
   },
   "correlation": {
-    "resolved": 0.4041,
-    "resolved_basis": "correlation_store",
+    "resolved": 0.4593248180905,
+    "resolved_basis": "captured_market_data_quote",
     "market_quote_flat": 0.4593248180905,
-    "note": "The resolved 0.4041 overrides the flat 0.459325 market-data quote."
+    "note": "Correlation taken from the captured fina-risk marketData.corr. The upstream lake-store value 0.4041 was not part of the imported capture."
   },
   "market_data": {
     "as_of": "2026-09-07",
@@ -64,13 +64,14 @@
       "values": [
         [
           1.0,
-          0.4041
+          0.4593248180905
         ],
         [
-          0.4041,
+          0.4593248180905,
           1.0
         ]
-      ]
+      ],
+      "note": "Captured marketData.corr quote."
     },
     "discount_curve": {
       "provenance": "pinned",

@@ -93,8 +93,8 @@ PUT = DF · E[ max(Exercise − WorstFinal, 0) · 1{WorstFinal ≤ KI} ]     per
 Acceptance: the riga-flow PUT leg must land within **±5%** of **0.02112** — the band that
 covers the documented lane spread (0.02022 … 0.02198) — with a preference to reconcile to the
 target once the surface-read convention is fixed. Reproduce at **30,000 paths**,
-**seed 1729**, AAD off, ADBE–AMZN correlation ≈ **0.4041** (resolved from the correlation
-store, not the flat 0.459325 market-data quote).
+**seed 1729**, AAD off, ADBE–AMZN correlation ≈ **0.4593248180905** (the captured
+`marketData.corr` quote; the upstream lake-store value 0.4041 is not part of the imported capture).
 
 > **Units note.** The COUPON leg is quoted on a legacy ten-point scale (`×10`); FUNDING and
 > PUT are per-unit-of-notional. In consistent per-unit terms the note totals ≈ 1.00–1.04. The
@@ -124,7 +124,7 @@ store, not the flat 0.459325 market-data quote).
   "seed": 1729,
   "paths": 30000,
   "model": { "vol": "dupire_lv | surface", "knock_in": "EKI", "calendar": "NYSE" },
-  "correlation": { "ADBE": 0.4041, "AMZN": 0.4041 },
+  "correlation": { "ADBE": 0.4593248180905, "AMZN": 0.4593248180905 },
   "expected": {
     "put":     { "value": 0.02112,  "tol_rel": 0.05 },
     "funding": { "value": 0.985048, "tol_rel": 0.01 },

@@ -8,6 +8,9 @@ license.workspace = true
 name = "riga"
 path = "src/main.rs"
 
+[features]
+gpu = ["riga-engine/gpu"]
+
 [dependencies]
 riga-core = { path = "../riga-core" }
 riga-engine = { path = "../riga-engine" }

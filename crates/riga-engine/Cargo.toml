@@ -14,11 +14,12 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+cudarc = { version = "0.19", features = ["driver", "nvrtc", "cuda-13000"], optional = true }
 
 [features]
 # GPU path propagation (Phase 9). CPU is the portable default; a `gpu` build must
 # fail loudly rather than silently fall back to CPU (AC-10 / I-L3).
-gpu = []
+gpu = ["dep:cudarc"]
 simd = []
 
 [dev-dependencies]

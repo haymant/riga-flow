@@ -28,15 +28,16 @@ Start at [`docs/README.md`](docs/README.md). The tree is organised as:
 The branch includes a **CPU full-Phoenix engine** with **calibrated Dupire local volatility**
 built from the captured implied smile, alongside the earlier flat-ATM GBM proxy. It implements
 daily global KO, coupon accrual/memory, final-fixing EKI, redemption and discounted leg
-attribution; a graph-composed payoff runtime with scan-lowered memory carry; CRN FD Greeks with
+attribution; **correlation Cholesky and correlated-Brownian PathCube generation** (`Y = L·Z`,
+N factors); a graph-composed payoff runtime with scan-lowered memory carry; CRN FD Greeks with
 a measured variance-reduction factor; composition clustering with an LRU scenario cache and
 100k-trade occupancy evidence; a batched risk report with PnL explain; replay / PathCube
-queries; a portable SIMD worst-of kernel; and a `gpu` feature that fails loudly with no silent
-CPU fallback.
+queries; a portable SIMD worst-of kernel; and a **CUDA `gpu` backend** (bit-identical worst-of
+kernel on the RTX 3060 Ti, ~20–23× resident vs CPU) that fails loudly if no device is present.
 
 The captured `termsheet1` market (as-of marks, full smile, curve, resolved correlation) is pinned
 in [`docs/fixture/termsheet1.json`](docs/fixture/termsheet1.json), and the PUT leg now reconciles
-to **0.020505** — **−2.91%** of the `0.02112` anchor, inside the ±5% AC-C0 band, with fixture
+to **0.020329** — **−3.75%** of the `0.02112` anchor, inside the ±5% AC-C0 band, with fixture
 acceptance **`passed`**. See the [phase-by-phase evidence report](docs/plan/25-implementation-evidence.md)
 for per-phase exit criteria, evidence and remaining work, and the
 [PUT reconciliation investigation](docs/fixture/termsheet1-put-reconciliation.md). The `fina-builder`
