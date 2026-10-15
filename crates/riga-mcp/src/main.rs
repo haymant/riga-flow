@@ -1600,6 +1600,38 @@ fn rca_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError
 
 fn governance_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
     let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
+    // Full evidence lineage: determinant envelope + legs + ledger + sampled event-bearing paths.
+    let records = explain::run_paths(&fx.request).map_err(ToolError::from_engine)?;
+    let sampled_paths: Vec<Value> = records
+        .iter()
+        .filter(|r| r.knocked_out || r.ki_hit)
+        .take(5)
+        .map(|r| {
+            json!({
+                "path_id": r.identity.path_id,
+                "rng_seed": r.identity.rng_seed,
+                "sobol_index": r.identity.sobol_index,
+                "knocked_out": r.knocked_out,
+                "ki_hit": r.ki_hit,
+                "worst_final": r.worst_final,
+                "put_payoff": r.put_payoff,
+            })
+        })
+        .collect();
+    let evidence_refs: Vec<String> = result
+        .ledger
+        .iter()
+        .flat_map(|e| e.evidence_refs.clone())
+        .collect();
+    let lineage = json!({
+        "determinism": result.determinism,
+        "legs": result.legs,
+        "ledger": result.ledger,
+        "stats": result.stats,
+        "trace_events": result.trace_events,
+        "sampled_paths": sampled_paths,
+        "evidence_refs": evidence_refs,
+    });
     Ok(json!({
         "model": fx.engine_model,
         "source_model": fx.source_model,
@@ -1613,6 +1645,7 @@ fn governance_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, To
             "PathCube is not persisted; replay reconstructs deterministically from (seed, path_id)",
         ],
         "stress_methodology": "central finite differences with common random numbers",
+        "lineage": lineage,
         "evidence": {
             "market_snapshot_id": result.determinism.market_snapshot_id,
             "seed": result.determinism.seed,
