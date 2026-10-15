@@ -32,10 +32,12 @@ extern "C" __global__ void worst_of(const float* a, const float* b, float* o, in
 
 // One thread per path. `normals` are the correlated shocks [path, step, 2];
 // `rows` are the per-step local-vol rows [factor, step, gx]; `ls_axis` holds each
-// factor's log-strike axis (2*gx values); terminal spots are written to `out` [path, 2].
+// factor's log-strike axis (2*gx values). Terminal spots -> `out` [path, 2];
+// first autocall step (or -1) -> `ko_out` [path].
 extern "C" __global__ void lv_propagate(
     const float* normals, const float* rows, const float* ls_axis,
-    const float* s0, float* out,
+    const float* s0, float* out, int* ko_out,
+    float ref0, float ref1, float ko_bar,
     int paths, int steps, int gx, float dt, float rate, float q0, float q1) {
     int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= paths) return;
@@ -46,6 +48,7 @@ extern "C" __global__ void lv_propagate(
     float inv0 = 1.0f / (ls_axis[gx - 1] - lo0);
     float lo1 = ls_axis[gx];
     float inv1 = 1.0f / (ls_axis[2 * gx - 1] - lo1);
+    int ko = -1;
     for (int s = 0; s < steps; ++s) {
         float x0 = (ls0 - lo0) * inv0 * (float)(gx - 1);
         if (x0 < 0.0f) x0 = 0.0f;
@@ -64,9 +67,11 @@ extern "C" __global__ void lv_propagate(
         int nb = (p * steps + s) * 2;
         ls0 += (rate - q0 - 0.5f * sig0 * sig0) * dt + sig0 * sq * normals[nb];
         ls1 += (rate - q1 - 0.5f * sig1 * sig1) * dt + sig1 * sq * normals[nb + 1];
+        if (ko < 0 && expf(ls0) / ref0 >= ko_bar && expf(ls1) / ref1 >= ko_bar) ko = s;
     }
     out[p * 2] = expf(ls0);
     out[p * 2 + 1] = expf(ls1);
+    ko_out[p] = ko;
 }
 "#;
 
@@ -207,12 +212,14 @@ extern "C" __global__ void lv_propagate(
             rows: &[f32],
             ls_axis: &[f32],
             s0: &[f32],
+            references: &[f32],
+            call_barrier: f32,
             paths: usize,
             steps: usize,
             dt: f32,
             rate: f32,
             dividends: &[f32],
-        ) -> Result<Vec<f32>, RigaError> {
+        ) -> Result<(Vec<f32>, Vec<i32>), RigaError> {
             let gx = ls_axis.len() / 2; // per-factor grid width; ls_axis holds 2 axes
             let func = self
                 .module
@@ -232,8 +239,12 @@ extern "C" __global__ void lv_propagate(
             let mut out = stream
                 .alloc_zeros::<f32>(paths * 2)
                 .map_err(|e| gpu_err("alloc out", e))?;
+            let mut ko_out = stream
+                .alloc_zeros::<i32>(paths)
+                .map_err(|e| gpu_err("alloc ko", e))?;
             let cfg = LaunchConfig::for_num_elems(paths as u32);
             let (paths_i, steps_i, gx_i) = (paths as i32, steps as i32, gx as i32);
+            let (ref0, ref1) = (references[0], references[1]);
             let q0 = dividends[0];
             let q1 = dividends[1];
             unsafe {
@@ -244,6 +255,10 @@ extern "C" __global__ void lv_propagate(
                     .arg(&ls_dev)
                     .arg(&s0_dev)
                     .arg(&mut out)
+                    .arg(&mut ko_out)
+                    .arg(&ref0)
+                    .arg(&ref1)
+                    .arg(&call_barrier)
                     .arg(&paths_i)
                     .arg(&steps_i)
                     .arg(&gx_i)
@@ -254,7 +269,11 @@ extern "C" __global__ void lv_propagate(
                     .launch(cfg)
                     .map_err(|e| gpu_err("lv launch", e))?;
             }
-            stream.clone_dtoh(&out).map_err(|e| gpu_err("D2H out", e))
+            let terminal = stream.clone_dtoh(&out).map_err(|e| gpu_err("D2H out", e))?;
+            let ko = stream
+                .clone_dtoh(&ko_out)
+                .map_err(|e| gpu_err("D2H ko", e))?;
+            Ok((terminal, ko))
         }
 
         /// Upload the two performance slices once and keep them resident on the
@@ -376,14 +395,26 @@ extern "C" __global__ void lv_propagate(
         rows: &[f32],
         ls_axis: &[f32],
         s0: &[f32],
+        references: &[f32],
+        call_barrier: f32,
         paths: usize,
         steps: usize,
         dt: f32,
         rate: f32,
         dividends: &[f32],
-    ) -> Result<Vec<f32>, RigaError> {
+    ) -> Result<(Vec<f32>, Vec<i32>), RigaError> {
         device()?.lv_terminal_spots(
-            normals, rows, ls_axis, s0, paths, steps, dt, rate, dividends,
+            normals,
+            rows,
+            ls_axis,
+            s0,
+            references,
+            call_barrier,
+            paths,
+            steps,
+            dt,
+            rate,
+            dividends,
         )
     }
 }

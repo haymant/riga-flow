@@ -1,5 +1,8 @@
 //! CPU vs GPU Dupire-LV path propagation on the termsheet1 fixture (Phase 9).
 //!
+//! Reports both the standalone down-and-in put (`DF·E[(K−w_T)⁺·1{w_T≤KI}]`) and the
+//! **KO-gated** production PUT leg (a path that autocalls pays no put).
+//!
 //! Run: `cargo run --release -p riga-engine --features gpu --example gpu_lv_bench`
 
 fn main() {
@@ -30,6 +33,10 @@ fn run() {
     let steps = req.trade.steps;
     let dt = req.trade.maturity_years / steps as f64;
     let rate = req.market.risk_free_rate;
+    let strike = req.trade.strike;
+    let ki = req.trade.knock_in_barrier;
+    let call_barrier = req.trade.knock_out_barrier.unwrap_or(f64::INFINITY);
+    let init = [req.trade.initial_spots[0], req.trade.initial_spots[1]];
     let chol = riga_market::CorrelationMatrix::from_rows(&req.market.correlation)
         .unwrap()
         .cholesky()
@@ -63,17 +70,19 @@ fn run() {
         ls_axis.extend(lv[f].log_strike_axis().iter().map(|&x| x as f32));
     }
     let s0 = [req.market.spots[0] as f32, req.market.spots[1] as f32];
+    let refs = [init[0] as f32, init[1] as f32];
     let divs = [
         req.market.dividend_yields[0] as f32,
         req.market.dividend_yields[1] as f32,
     ];
     let df = (-rate * req.trade.maturity_years).exp();
 
-    // CPU reference (f64) — the production `sigma(t, S)` local-vol lookup.
+    // CPU reference (f64): production `sigma(t, S)` lookup + KO gating.
     let t_cpu = Instant::now();
-    let mut cpu_sum = 0.0f64;
+    let (mut cpu_standalone, mut cpu_gated) = (0.0f64, 0.0f64);
     for p in 0..paths {
         let mut spots = [req.market.spots[0], req.market.spots[1]];
+        let mut ko = false;
         for s in 0..steps {
             for f in 0..2 {
                 let vol = lv[f].sigma(s as f64 * dt, spots[f]);
@@ -81,23 +90,34 @@ fn run() {
                 spots[f] *=
                     (drift + vol * dt.sqrt() * shocks_f32[(p * steps + s) * 2 + f] as f64).exp();
             }
+            if !ko && spots[0] / init[0] >= call_barrier && spots[1] / init[1] >= call_barrier {
+                ko = true;
+            }
         }
-        let worst =
-            (spots[0] / req.trade.initial_spots[0]).min(spots[1] / req.trade.initial_spots[1]);
-        if worst <= req.trade.knock_in_barrier {
-            cpu_sum += (req.trade.strike - worst).max(0.0);
+        let worst = (spots[0] / init[0]).min(spots[1] / init[1]);
+        if worst <= ki {
+            let payoff = (strike - worst).max(0.0);
+            cpu_standalone += payoff;
+            if !ko {
+                cpu_gated += payoff;
+            }
         }
     }
-    let cpu_put = cpu_sum / paths as f64 * df;
+    let (cpu_standalone, cpu_gated) = (
+        cpu_standalone / paths as f64 * df,
+        cpu_gated / paths as f64 * df,
+    );
     let cpu_s = t_cpu.elapsed().as_secs_f64();
 
-    // GPU propagation (f32, one kernel launch per block).
+    // GPU propagation (f32) — terminal spots + first autocall step.
     let t_gpu = Instant::now();
-    let term = riga_engine::gpu::lv_terminal_spots(
+    let (term, ko) = riga_engine::gpu::lv_terminal_spots(
         &shocks_f32,
         &rows,
         &ls_axis,
         &s0,
+        &refs,
+        call_barrier as f32,
         paths,
         steps,
         dt as f32,
@@ -105,26 +125,33 @@ fn run() {
         &divs,
     )
     .unwrap();
-    let mut gpu_sum = 0.0f64;
+    let (mut gpu_standalone, mut gpu_gated) = (0.0f64, 0.0f64);
     for p in 0..paths {
-        let worst = ((term[p * 2] as f64) / req.trade.initial_spots[0])
-            .min((term[p * 2 + 1] as f64) / req.trade.initial_spots[1]);
-        if worst <= req.trade.knock_in_barrier {
-            gpu_sum += (req.trade.strike - worst).max(0.0);
+        let worst = ((term[p * 2] as f64) / init[0]).min((term[p * 2 + 1] as f64) / init[1]);
+        if worst <= ki {
+            let payoff = (strike - worst).max(0.0);
+            gpu_standalone += payoff;
+            if ko[p] < 0 {
+                gpu_gated += payoff;
+            }
         }
     }
-    let gpu_put = gpu_sum / paths as f64 * df;
+    let (gpu_standalone, gpu_gated) = (
+        gpu_standalone / paths as f64 * df,
+        gpu_gated / paths as f64 * df,
+    );
     let gpu_s = t_gpu.elapsed().as_secs_f64();
 
     println!("device: {}", riga_engine::gpu::device_name().unwrap());
-    println!("paths={paths} steps={steps} gx={gx} (per-factor log-strike axes)");
+    println!("paths={paths} steps={steps} gx={gx}");
+    println!("standalone down-and-in PUT:  CPU {cpu_standalone:.6}  |  GPU {gpu_standalone:.6}");
     println!(
-        "LV PUT  CPU(f64) {cpu_put:.6} in {cpu_s:.3}s  |  GPU(f32, H2D+kernel+D2H) {gpu_put:.6} in {gpu_s:.3}s"
+        "KO-gated production PUT leg: CPU {cpu_gated:.6}  |  GPU {gpu_gated:.6}   (fixture anchor 0.020329)"
     );
     println!(
-        "|delta| {:.3e}  relative {:.3e}  | propagation speedup {:.2}x",
-        (cpu_put - gpu_put).abs(),
-        (cpu_put - gpu_put).abs() / cpu_put,
+        "gated |delta| {:.3e} rel {:.3e}  |  CPU {cpu_s:.3}s GPU {gpu_s:.3}s ({:.2}x)",
+        (cpu_gated - gpu_gated).abs(),
+        (cpu_gated - gpu_gated).abs() / cpu_gated,
         cpu_s / gpu_s
     );
 }
