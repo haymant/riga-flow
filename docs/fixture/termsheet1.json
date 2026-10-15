@@ -1,0 +1,234 @@
+{
+  "fixture": "termsheet1",
+  "schema_version": "1.0.0",
+  "role": "legacy_reference_alignment",
+  "purpose": "First-build alignment anchor for riga-flow; the down-and-in PUT leg is pinned at ≈ 0.02112 and must reconcile within ±5% (AC-C0).",
+  "source": "Memory US Stocks ELI — ADBE/AMZN final term sheet",
+  "captured_from": "legacy pricing system",
+  "as_of": "2026-09-07",
+  "currency": "USD",
+  "human_readable_twin": "termsheet1.md",
+  "authoritative_spec": "../plan/23-testing-validation.md#3",
+  "provenance": {
+    "trade_economics": "pinned — issuer final term sheet",
+    "expected": "pinned — legacy-engine reference values",
+    "market_data.initial_fixings": "pinned — spec §3.1",
+    "market_data.correlation": "pinned — spec §3.2",
+    "market_data.discount_curve": "reference — NOT stated in spec; placeholder",
+    "market_data.dividend_yields": "reference — NOT stated in spec; placeholder",
+    "market_data.vol_surfaces": "reference — NOT stated in spec; placeholder",
+    "market_data.coupon_barrier": "reference — NOT stated in spec; placeholder",
+    "market_data.payment_lag_business_days": "reference — NOT stated in spec; placeholder"
+  },
+  "run": {
+    "seed": 1729,
+    "paths": 30000,
+    "path_block_size": 4096,
+    "variance_reduction": {
+      "kind": "none"
+    },
+    "trace_level": "aggregated",
+    "aad": false
+  },
+  "model": {
+    "process": "dupire_local_vol",
+    "vol_source": "implied_surface",
+    "knock_in": "EKI",
+    "knock_out": "global",
+    "calendar": "NYSE",
+    "day_count": "Actual/365"
+  },
+  "correlation": {
+    "resolved": 0.4041,
+    "resolved_basis": "correlation_store",
+    "market_quote_flat": 0.459325,
+    "note": "The resolved 0.4041 overrides the flat 0.459325 market-data quote."
+  },
+  "market_data": {
+    "as_of": "2026-09-07",
+    "initial_fixings": {
+      "provenance": "pinned",
+      "basis": "initial_fixing",
+      "spots": {
+        "ADBE": 239.97,
+        "AMZN": 260.0
+      }
+    },
+    "correlation_matrix": {
+      "provenance": "pinned",
+      "order": ["ADBE", "AMZN"],
+      "values": [
+        [1.0, 0.4041],
+        [0.4041, 1.0]
+      ]
+    },
+    "discount_curve": {
+      "provenance": "reference",
+      "index": "USD-SOFR-OIS",
+      "compounding": "continuous",
+      "day_count": "Actual/365",
+      "points": [
+        { "tenor": "1M", "zero_rate": 0.0405 },
+        { "tenor": "3M", "zero_rate": 0.0395 },
+        { "tenor": "6M", "zero_rate": 0.0380 },
+        { "tenor": "12M", "zero_rate": 0.0370 }
+      ]
+    },
+    "dividend_yields": {
+      "provenance": "reference",
+      "annual_continuous": {
+        "ADBE": 0.0065,
+        "AMZN": 0.0
+      }
+    },
+    "vol_surfaces": {
+      "provenance": "reference",
+      "kind": "implied_atm_term_structure",
+      "note": "Full strike×tenor surface is calibrated to Dupire LV; only the ATM term structure is shown here.",
+      "ADBE": [
+        { "tenor": "1M", "atm_implied_vol": 0.32 },
+        { "tenor": "3M", "atm_implied_vol": 0.33 },
+        { "tenor": "6M", "atm_implied_vol": 0.34 },
+        { "tenor": "9M", "atm_implied_vol": 0.35 }
+      ],
+      "AMZN": [
+        { "tenor": "1M", "atm_implied_vol": 0.30 },
+        { "tenor": "3M", "atm_implied_vol": 0.31 },
+        { "tenor": "6M", "atm_implied_vol": 0.32 },
+        { "tenor": "9M", "atm_implied_vol": 0.33 }
+      ]
+    },
+    "session_calendar": {
+      "provenance": "pinned",
+      "id": "NYSE"
+    }
+  },
+  "trade_economics": {
+    "provenance": "pinned",
+    "trade_id": "termsheet1",
+    "product": "Memory US Stocks ELI",
+    "product_long": "worst-of autocallable, daily memory, final-fixing-date (European) knock-in",
+    "payoff_family": "Autocallable",
+    "basket": ["ADBE", "AMZN"],
+    "basket_cardinality": 2,
+    "worst_of": true,
+    "notional": 10000.0,
+    "currency": "USD",
+    "issue_price": 1.0,
+    "trade_date": "2026-04-24",
+    "issue_date": "2026-05-01",
+    "final_fixing_date": "2027-02-01",
+    "investment_period_months": 9,
+    "observation_topology": {
+      "id": "daily_range_accrual__daily_ko__european_ki",
+      "coupon_observation": "daily",
+      "call_observation": "daily",
+      "knock_in_observation": "final_fixing"
+    },
+    "settlement": {
+      "if_knock_in": "physical_worst_name",
+      "if_no_knock_in": "cash"
+    },
+    "reference_assets": [
+      {
+        "symbol": "ADBE",
+        "initial_spot": 239.97,
+        "call_price": 263.967,
+        "exercise_price": 187.1766,
+        "knock_in_price": 167.979,
+        "weight": 0.5
+      },
+      {
+        "symbol": "AMZN",
+        "initial_spot": 260.0,
+        "call_price": 286.0,
+        "exercise_price": 202.8,
+        "knock_in_price": 182.0,
+        "weight": 0.5
+      }
+    ],
+    "barriers": {
+      "call": { "level_pct": 1.1, "basis": "initial_spot" },
+      "exercise": { "level_pct": 0.78, "basis": "initial_spot" },
+      "knock_in": { "level_pct": 0.7, "basis": "initial_spot" },
+      "coupon": { "level_pct": 1.0, "basis": "initial_spot", "provenance": "reference" }
+    },
+    "coupon": {
+      "periods": 9,
+      "rate_per_period": 0.009642,
+      "memory": true,
+      "period_1": "fixed",
+      "periods_2_9": "day_in_accrual",
+      "quote_scale": 10.0
+    },
+    "callable": {
+      "period_start": "2026-06-01",
+      "period_end": "2027-02-01",
+      "frequency": "daily",
+      "condition": "every reference asset has reached >= its call price on a call fixing date",
+      "ko_type": "global",
+      "american": true
+    },
+    "knock_in": {
+      "type": "EKI",
+      "condition": "worst final-fixing performance <= 0.70"
+    },
+    "schedule": [
+      { "period": 1, "start": "2026-05-01", "observation": "2026-06-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "fixed" },
+      { "period": 2, "start": "2026-06-01", "observation": "2026-07-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" },
+      { "period": 3, "start": "2026-07-01", "observation": "2026-08-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" },
+      { "period": 4, "start": "2026-08-01", "observation": "2026-09-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" },
+      { "period": 5, "start": "2026-09-01", "observation": "2026-10-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" },
+      { "period": 6, "start": "2026-10-01", "observation": "2026-11-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" },
+      { "period": 7, "start": "2026-11-01", "observation": "2026-12-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" },
+      { "period": 8, "start": "2026-12-01", "observation": "2027-01-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" },
+      { "period": 9, "start": "2027-01-01", "observation": "2027-02-01", "payment_lag_business_days": 2, "coupon_rate": 0.009642, "coupon_type": "day_in" }
+    ],
+    "payoff": {
+      "legs": ["down_and_in_put", "funding", "coupon"],
+      "put_formula": "DF * E[ max(Exercise - WorstFinal, 0) * 1{WorstFinal <= KI} ]",
+      "put_units": "per_unit_of_notional",
+      "nodes": [
+        "worst_of_performance",
+        "range_accrual",
+        "memory_carry",
+        "global_ko_gate",
+        "knock_in_gate",
+        "down_and_in_put",
+        "notional_return",
+        "payment_discount",
+        "aggregate_legs"
+      ]
+    }
+  },
+  "expected": {
+    "provenance": "pinned",
+    "put": { "value": 0.02112, "tol_rel": 0.05, "units": "per_unit_of_notional" },
+    "funding": { "value": 0.985048, "tol_rel": 0.01, "units": "per_unit_of_notional" },
+    "coupon": { "value": 0.380634, "tol_rel": 0.02, "quote_scale": 10.0 },
+    "ki_prob": { "value": 0.1486, "tol_abs": 0.02 },
+    "lane_spread": {
+      "put_eki_gated_dupire_lv": 0.02198,
+      "put_daily_eki_lane": 0.02022,
+      "put_target": 0.02112
+    },
+    "full_note_mixed_scale": 1.34
+  },
+  "units": {
+    "per_unit_legs": ["put", "funding"],
+    "ten_point_scale_legs": { "coupon": 10.0 },
+    "note": "COUPON is quoted on a legacy ten-point scale (×10); PUT and FUNDING are per unit of notional. In consistent per-unit terms the note totals ≈ 1.00–1.04."
+  },
+  "to_capture": [
+    { "path": "market_data.discount_curve", "reason": "Not stated in plan/23-testing-validation.md §3" },
+    { "path": "market_data.dividend_yields", "reason": "Not stated in plan/23-testing-validation.md §3" },
+    { "path": "market_data.vol_surfaces", "reason": "Only the model tier is stated; surface points not stated" },
+    { "path": "trade_economics.barriers.coupon", "reason": "Coupon barrier level not stated in spec" },
+    { "path": "trade_economics.schedule[].payment_lag_business_days", "reason": "Payment lag convention not stated in spec" }
+  ],
+  "notes": [
+    "Values tagged provenance=pinned come from the authoritative spec and must not drift.",
+    "Values tagged provenance=reference are clearly-labelled placeholders; replace with the captured legacy snapshot before using this as a byte-pinned golden.",
+    "Every numeric change to this fixture is a decision and must be committed with the code change that causes it (I-V2)."
+  ]
+}

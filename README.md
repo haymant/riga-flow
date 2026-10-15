@@ -21,6 +21,7 @@ Start at [`docs/README.md`](docs/README.md). The tree is organised as:
 | [`docs/plan/`](docs/plan/) | roadmap, build plan, acceptance criteria, testing, gaps & risks |
 | [`docs/mcp/`](docs/mcp/) | MCP server design, tool catalog, implementation (`rmcp`) |
 | [`docs/handoff/`](docs/handoff/) | handoff to `fina-builder` for the visual atlas |
+| [`docs/fixture/`](docs/fixture/) | pinned reference fixtures — e.g. [`termsheet1`](docs/fixture/termsheet1.md) (real terms) + [`termsheet1.json`](docs/fixture/termsheet1.json) (market data + trade economics) |
 
 ## Status
 

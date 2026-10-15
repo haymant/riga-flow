@@ -134,6 +134,13 @@ store, not the flat 0.459325 market-data quote).
 }
 ```
 
+The expanded, provenance-tagged fixture — real terms in human-readable form plus the full
+market-data and trade-economics record — lives under
+[`../fixture/termsheet1.md`](../fixture/termsheet1.md) (terms) and
+[`../fixture/termsheet1.json`](../fixture/termsheet1.json) (market data + trade economics).
+Values the spec does not pin are marked `reference` and listed in the fixture's `to_capture`
+array.
+
 This is the first **cross-engine** fixture: riga-flow's output is checked against established
 legacy pricing numbers, not only against its own reference MC.
 
