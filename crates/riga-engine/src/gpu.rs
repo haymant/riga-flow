@@ -23,11 +23,50 @@ mod imp {
     use std::ffi::{CStr, CString, c_char};
     use std::sync::{Arc, OnceLock};
 
-    /// Worst-of device kernel: `o[i] = min(a[i], b[i])`.
+    /// Worst-of device kernel and the local-vol path-propagation kernel.
     const KERNEL_SRC: &str = r#"
 extern "C" __global__ void worst_of(const float* a, const float* b, float* o, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) o[i] = a[i] < b[i] ? a[i] : b[i];
+}
+
+// One thread per path. `normals` are the correlated shocks [path, step, 2];
+// `rows` are the per-step local-vol rows [factor, step, gx]; `ls_axis` holds each
+// factor's log-strike axis (2*gx values); terminal spots are written to `out` [path, 2].
+extern "C" __global__ void lv_propagate(
+    const float* normals, const float* rows, const float* ls_axis,
+    const float* s0, float* out,
+    int paths, int steps, int gx, float dt, float rate, float q0, float q1) {
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= paths) return;
+    float ls0 = logf(s0[0]);
+    float ls1 = logf(s0[1]);
+    float sq = sqrtf(dt);
+    float lo0 = ls_axis[0];
+    float inv0 = 1.0f / (ls_axis[gx - 1] - lo0);
+    float lo1 = ls_axis[gx];
+    float inv1 = 1.0f / (ls_axis[2 * gx - 1] - lo1);
+    for (int s = 0; s < steps; ++s) {
+        float x0 = (ls0 - lo0) * inv0 * (float)(gx - 1);
+        if (x0 < 0.0f) x0 = 0.0f;
+        if (x0 > (float)(gx - 1)) x0 = (float)(gx - 1);
+        int j0 = (int)x0; if (j0 > gx - 2) j0 = gx - 2;
+        float w0 = x0 - (float)j0;
+        int b0 = s * gx;
+        float sig0 = rows[b0 + j0] * (1.0f - w0) + rows[b0 + j0 + 1] * w0;
+        float x1 = (ls1 - lo1) * inv1 * (float)(gx - 1);
+        if (x1 < 0.0f) x1 = 0.0f;
+        if (x1 > (float)(gx - 1)) x1 = (float)(gx - 1);
+        int j1 = (int)x1; if (j1 > gx - 2) j1 = gx - 2;
+        float w1 = x1 - (float)j1;
+        int b1 = (steps + s) * gx;
+        float sig1 = rows[b1 + j1] * (1.0f - w1) + rows[b1 + j1 + 1] * w1;
+        int nb = (p * steps + s) * 2;
+        ls0 += (rate - q0 - 0.5f * sig0 * sig0) * dt + sig0 * sq * normals[nb];
+        ls1 += (rate - q1 - 0.5f * sig1 * sig1) * dt + sig1 * sq * normals[nb + 1];
+    }
+    out[p * 2] = expf(ls0);
+    out[p * 2 + 1] = expf(ls1);
 }
 "#;
 
@@ -160,6 +199,64 @@ extern "C" __global__ void worst_of(const float* a, const float* b, float* o, in
             stream.clone_dtoh(&out_dev).map_err(|e| gpu_err("D2H", e))
         }
 
+        /// Propagate paths under a state-dependent local vol; terminal spots `[path, 2]`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn lv_terminal_spots(
+            &self,
+            normals: &[f32],
+            rows: &[f32],
+            ls_axis: &[f32],
+            s0: &[f32],
+            paths: usize,
+            steps: usize,
+            dt: f32,
+            rate: f32,
+            dividends: &[f32],
+        ) -> Result<Vec<f32>, RigaError> {
+            let gx = ls_axis.len() / 2; // per-factor grid width; ls_axis holds 2 axes
+            let func = self
+                .module
+                .load_function("lv_propagate")
+                .map_err(|e| gpu_err("load lv kernel", e))?;
+            let stream = self.ctx.default_stream();
+            let normals_dev = stream
+                .clone_htod(normals)
+                .map_err(|e| gpu_err("H2D normals", e))?;
+            let rows_dev = stream
+                .clone_htod(rows)
+                .map_err(|e| gpu_err("H2D rows", e))?;
+            let ls_dev = stream
+                .clone_htod(ls_axis)
+                .map_err(|e| gpu_err("H2D ls", e))?;
+            let s0_dev = stream.clone_htod(s0).map_err(|e| gpu_err("H2D s0", e))?;
+            let mut out = stream
+                .alloc_zeros::<f32>(paths * 2)
+                .map_err(|e| gpu_err("alloc out", e))?;
+            let cfg = LaunchConfig::for_num_elems(paths as u32);
+            let (paths_i, steps_i, gx_i) = (paths as i32, steps as i32, gx as i32);
+            let q0 = dividends[0];
+            let q1 = dividends[1];
+            unsafe {
+                stream
+                    .launch_builder(&func)
+                    .arg(&normals_dev)
+                    .arg(&rows_dev)
+                    .arg(&ls_dev)
+                    .arg(&s0_dev)
+                    .arg(&mut out)
+                    .arg(&paths_i)
+                    .arg(&steps_i)
+                    .arg(&gx_i)
+                    .arg(&dt)
+                    .arg(&rate)
+                    .arg(&q0)
+                    .arg(&q1)
+                    .launch(cfg)
+                    .map_err(|e| gpu_err("lv launch", e))?;
+            }
+            stream.clone_dtoh(&out).map_err(|e| gpu_err("D2H out", e))
+        }
+
         /// Upload the two performance slices once and keep them resident on the
         /// device, so a caller can run the kernel repeatedly without re-transferring.
         pub fn resident_worst_of(
@@ -271,10 +368,31 @@ extern "C" __global__ void worst_of(const float* a, const float* b, float* o, in
     pub fn resident_worst_of(a: &[f32], b: &[f32]) -> Result<ResidentWorstOf, RigaError> {
         device()?.resident_worst_of(a, b)
     }
+
+    /// Propagate paths under a state-dependent local vol on the GPU; terminal spots `[path, 2]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lv_terminal_spots(
+        normals: &[f32],
+        rows: &[f32],
+        ls_axis: &[f32],
+        s0: &[f32],
+        paths: usize,
+        steps: usize,
+        dt: f32,
+        rate: f32,
+        dividends: &[f32],
+    ) -> Result<Vec<f32>, RigaError> {
+        device()?.lv_terminal_spots(
+            normals, rows, ls_axis, s0, paths, steps, dt, rate, dividends,
+        )
+    }
 }
 
 #[cfg(feature = "gpu")]
-pub use imp::{ResidentWorstOf, arch, device_name, ensure_available, resident_worst_of, worst_of};
+pub use imp::{
+    ResidentWorstOf, arch, device_name, ensure_available, lv_terminal_spots, resident_worst_of,
+    worst_of,
+};
 
 /// The GPU backend is only present in a `gpu` build.
 #[cfg(not(feature = "gpu"))]
