@@ -18,8 +18,8 @@
     "market_data.dividend_yields": "pinned",
     "market_data.vol_surfaces": "pinned",
     "market_data.local_vol_surfaces": "pinned",
-    "market_data.coupon_barrier": "pinned",
-    "market_data.payment_lag_business_days": "pinned"
+    "market_data.payment_lag_business_days": "pinned",
+    "trade_economics.coupon_barrier": "pinned"
   },
   "run": {
     "seed": 1729,
@@ -825,9 +825,10 @@
         "basis": "initial_spot"
       },
       "coupon": {
-        "level_pct": 1.0,
+        "level_pct": 0.1,
         "basis": "initial_spot",
-        "provenance": "reference"
+        "provenance": "pinned",
+        "source": "Issuer term sheet: 10% of initial spot for period-1 barrier and periods-2-to-9 floor"
       }
     },
     "coupon": {

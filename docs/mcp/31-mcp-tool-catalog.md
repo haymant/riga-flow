@@ -9,6 +9,12 @@
 `<verb>_<object>` in `snake_case`. Every tool returns the uniform error shape and, for
 pricing/risk/explain tools, the determinism envelope.
 
+The catalog below remains the normative target. The current `riga-mcp` adapter implements a
+subset (`health`, `price_put`, `price_trade`, `explain_pv_attribution`, `replay_path`,
+`query_pathcube`, `query_path_cube` as an additive spelling alias, and `risk_batch`); resources,
+prompts, book tools and task progress/cancellation remain open gates in
+[`../plan/25-implementation-evidence.md`](../plan/25-implementation-evidence.md).
+
 ## 2. Pricing & simulation tools
 
 | Tool | Purpose | Key inputs | Output |

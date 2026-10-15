@@ -77,9 +77,14 @@ implementing yourself anyway."
 
 ### 3.2 GPU behind a feature
 
-`gpu` is a compile-time feature (CPU is the portable default), exactly as `fina-builder`
-treats its CUDA build. No silent fallback: a GPU build that cannot initialise must fail
-loudly.
+`gpu` remains a compile-time Cargo feature and raw Cargo commands keep the portable CPU
+default. The repository `Makefile` is the canonical local entrypoint: `make` auto-enables
+`riga-engine/gpu` only when an NVIDIA device, driver library, and CUDA 13 NVRTC runtime are
+available; `nvcc` is not required because kernels are JIT-compiled by NVRTC. Otherwise it
+builds/tests with the GPU feature off. `make GPU=off` forces CPU and `make GPU=on` explicitly
+preflights and requests CUDA without fallback. `make GPU=on gpu-test` performs the hardware gate.
+The current CUDA implementation is a standalone worst-of kernel; production Phoenix pricing is
+not yet GPU-offloaded. A GPU-enabled runtime that cannot initialise the device must fail loudly.
 
 ## 4. Profiles
 

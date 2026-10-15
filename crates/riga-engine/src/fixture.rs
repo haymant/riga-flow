@@ -416,9 +416,9 @@ pub fn load_termsheet1_fixture(path: impl AsRef<Path>) -> Result<LoadedFixture, 
                 })
             }),
         market_quality_note: if has_local_vol {
-            "Captured fina-risk market: current as-of marks, full implied smile, USD discount curve, and resolved correlation.".to_owned()
+            "Captured fina-risk market: current as-of marks, full implied smile calibrated to Dupire local vol, USD discount curve, dividends, resolved correlation, and issuer-pinned coupon floor.".to_owned()
         } else {
-            "Source provides pinned initial fixings, not current as-of spots; discount, dividend, ATM-vol, coupon-barrier, and payment-lag inputs are tagged reference placeholders.".to_owned()
+            "Captured as-of market and issuer economics are loaded, but no full local-vol surface is present; pricing uses a flat-ATM GBM proxy rather than the source-declared Dupire model.".to_owned()
         },
         source_model: root["model"]["process"]
             .as_str()
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(request.trade.strike, 0.78);
         assert_eq!(request.trade.knock_in_barrier, 0.70);
         assert_eq!(request.trade.knock_out_barrier, Some(1.10));
-        assert_eq!(request.trade.coupon_barrier, Some(1.0));
+        assert_eq!(request.trade.coupon_barrier, Some(0.1));
         assert_eq!(request.trade.coupon_rate, Some(0.009642));
         assert!(request.trade.memory_coupon);
         assert_eq!(request.trade.coupon_periods, Some(5));

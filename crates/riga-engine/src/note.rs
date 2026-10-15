@@ -6,10 +6,34 @@ use riga_core::{
     DeterminismEnvelope, LedgerEntry, LegAttribution, PriceResult, RigaError, TransitionStats,
 };
 
+#[derive(Debug, Default, Clone, Copy)]
+struct OnlineMoments {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl OnlineMoments {
+    fn observe(&mut self, value: f64) {
+        self.count += 1;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (value - self.mean);
+    }
+
+    fn sample_variance(self) -> f64 {
+        if self.count > 1 {
+            self.m2 / (self.count - 1) as f64
+        } else {
+            0.0
+        }
+    }
+}
+
 /// CPU reference pricer for the termsheet1 Phoenix cash-flow skeleton.
 /// It streams one path at a time (block metadata is honoured, no full PathCube is retained).
-/// Market volatilities and rates are scalar proxies mapped from the fixture; this is not a
-/// calibrated Dupire local-volatility implementation.
+/// If `PriceRequest::local_vol` is present, each factor uses its calibrated Dupire surface;
+/// otherwise the flat market-volatility GBM proxy is used.
 pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaError> {
     validate(request)?;
     let local_vol = crate::build_local_vol(request)?;
@@ -28,25 +52,23 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
     let coupon_rate = request.trade.coupon_rate.unwrap_or(0.0);
     let mut rng = ChaCha8Rng::seed_from_u64(request.config.seed);
 
-    let mut pv_mean = 0.0;
-    let mut pv_m2 = 0.0;
-    let mut funding_m2 = 0.0;
-    let mut put_m2 = 0.0;
-    let mut coupon_m2 = 0.0;
+    let mut pv_moments = OnlineMoments::default();
+    let mut ko_funding_moments = OnlineMoments::default();
+    let mut ki_put_moments = OnlineMoments::default();
+    let mut coupon_moments = OnlineMoments::default();
     let mut put_sum = 0.0;
     let mut funding_sum = 0.0;
     let mut coupon_sum = 0.0;
     let mut coupon_memory_sum = 0.0;
     let mut ko_count = 0u64;
     let mut ki_count = 0u64;
+    let mut put_eligible_count = 0u64;
     let mut coupon_path_count = 0u64;
-    let mut ko_funding_sum = 0.0;
-    let mut ki_put_sum = 0.0;
     let snapshot_id = request.market.snapshot_id()?;
 
     for block_start in (0..paths).step_by(request.config.path_block_size) {
         let block_end = (block_start + request.config.path_block_size).min(paths);
-        for path_id in block_start..block_end {
+        for _ in block_start..block_end {
             let mut spots = [request.market.spots[0], request.market.spots[1]];
             let mut knocked_out = false;
             let mut redemption_time = request.trade.maturity_years;
@@ -63,11 +85,10 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
                 let z1_independent: f64 = rng.sample(StandardNormal);
                 let mut shocks = [0.0f64; 2];
                 chol.apply_into(&[z0, z1_independent], &mut shocks);
-                // Continue consuming the fixed per-path stream after KO. This keeps the
-                // next path's shocks invariant under spot/vol bumps (CRN path identity).
-                if knocked_out {
-                    continue;
-                }
+                // Continue evolving the market path after KO for the unconditional terminal-KI
+                // diagnostic; note cashflows stop. Consuming the full shock schedule also keeps
+                // each path's random stream invariant under CRN bumps.
+                let note_is_active = !knocked_out;
                 let time = (step + 1) as f64 * dt;
                 for factor in 0..2 {
                     let vol = match &local_vol {
@@ -81,6 +102,9 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
                 let worst = (spots[0] / request.trade.initial_spots[0])
                     .min(spots[1] / request.trade.initial_spots[1]);
                 final_worst = worst;
+                if !note_is_active {
+                    continue;
+                }
 
                 // The first coupon is fixed. Later coupons accrue on daily eligible observations.
                 let period = ((step * periods) / steps).min(periods - 1);
@@ -149,64 +173,45 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             let discount_redemption = (-rate * redemption_time).exp();
             let funding = discount_redemption;
             if knocked_out {
-                ko_funding_sum += funding;
+                ko_funding_moments.observe(funding);
             }
-            // The reported leg is the standalone European down-and-in put:
-            // DF * E[(K - w_T)+ * 1{w_T <= KI}], per the fixture's documented formula
-            // (no KO gate — KO affects funding/coupon, not this leg).
+            // KI probability is the unconditional terminal market event. The EKI PUT cashflow
+            // is payable only if the note survived the autocall lifecycle to final fixing.
             let hit_ki = final_worst <= request.trade.knock_in_barrier;
             if hit_ki {
                 ki_count += 1;
             }
-            let put = if hit_ki {
+            let put_eligible = hit_ki && !knocked_out;
+            if put_eligible {
+                put_eligible_count += 1;
+            }
+            let put = if put_eligible {
                 (request.trade.strike - final_worst).max(0.0)
                     * (-rate * request.trade.maturity_years).exp()
             } else {
                 0.0
             };
             if hit_ki {
-                ki_put_sum += put;
+                ki_put_moments.observe(put);
             }
             let coupon_nominal = path_coupon_pv + path_memory_coupon_pv;
             if path_received_coupon {
                 coupon_path_count += 1;
+                coupon_moments.observe(coupon_nominal);
             }
             let coupon_quote = coupon_nominal * 10.0;
             let memory_quote = path_memory_coupon_pv * 10.0;
             // PUT is the investor's embedded downside protection; subtract from issuer note value.
             let pv = funding + coupon_nominal - put;
-            let n = (path_id + 1) as f64;
-            let previous_funding_sum = funding_sum;
             funding_sum += funding;
-            let funding_delta = funding - previous_funding_sum / n;
-            funding_m2 += funding_delta * (funding - funding_sum / n);
-            let previous_put_sum = put_sum;
             put_sum += put;
-            let put_delta = put - previous_put_sum / n;
-            put_m2 += put_delta * (put - put_sum / n);
-            let previous_coupon_sum = coupon_sum + coupon_memory_sum;
             coupon_sum += coupon_quote - memory_quote;
             coupon_memory_sum += memory_quote;
-            let coupon_delta = coupon_nominal - previous_coupon_sum / n;
-            coupon_m2 += coupon_delta * (coupon_nominal - (coupon_sum + coupon_memory_sum) / n);
-            let delta = pv - pv_mean;
-            pv_mean += delta / n;
-            pv_m2 += delta * (pv - pv_mean);
+            pv_moments.observe(pv);
         }
     }
 
-    let variance = if paths > 1 {
-        pv_m2 / (paths - 1) as f64
-    } else {
-        0.0
-    };
-    let sample_variance = |m2: f64| {
-        if paths > 1 {
-            m2 / (paths - 1) as f64
-        } else {
-            0.0
-        }
-    };
+    let variance = pv_moments.sample_variance();
     let mc_error = (variance / paths as f64).sqrt();
     let ki_probability = ki_count as f64 / paths as f64;
     let mean_put = put_sum / paths as f64;
@@ -227,12 +232,8 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             input_count: paths as u64,
             output_count: ko_count,
             probability: ko_probability,
-            mean_payoff: if ko_count == 0 {
-                0.0
-            } else {
-                ko_funding_sum / ko_count as f64
-            },
-            variance_payoff: sample_variance(funding_m2),
+            mean_payoff: ko_funding_moments.mean,
+            variance_payoff: ko_funding_moments.sample_variance(),
             mean_delta: 0.0,
             mean_vega: 0.0,
         },
@@ -241,12 +242,8 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             input_count: paths as u64,
             output_count: ki_count,
             probability: ki_probability,
-            mean_payoff: if ki_count == 0 {
-                0.0
-            } else {
-                ki_put_sum / ki_count as f64
-            },
-            variance_payoff: sample_variance(put_m2),
+            mean_payoff: ki_put_moments.mean,
+            variance_payoff: ki_put_moments.sample_variance(),
             mean_delta: 0.0,
             mean_vega: 0.0,
         },
@@ -255,8 +252,8 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
             input_count: paths as u64,
             output_count: coupon_path_count,
             probability: coupon_probability,
-            mean_payoff: (mean_coupon_quote + mean_memory_quote) / 10.0,
-            variance_payoff: sample_variance(coupon_m2),
+            mean_payoff: coupon_moments.mean,
+            variance_payoff: coupon_moments.sample_variance(),
             mean_delta: 0.0,
             mean_vega: 0.0,
         },
@@ -283,11 +280,11 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
         LedgerEntry {
             transition_id: "final_fixing_eki_put".into(),
             condition: format!(
-                "paths with worst_final <= {:.6}; put strike {:.6}",
+                "terminal worst <= {:.6} and no prior autocall; put strike {:.6}",
                 request.trade.knock_in_barrier, request.trade.strike
             ),
-            population_before: paths as u64,
-            population_after: ki_count,
+            population_before: paths as u64 - ko_count,
+            population_after: put_eligible_count,
             pv_impact: -mean_put,
             delta_impact: 0.0,
             vega_impact: 0.0,
@@ -324,4 +321,111 @@ pub fn price_full_phoenix(request: &PriceRequest) -> Result<PriceResult, RigaErr
         ledger,
         determinism,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::load_termsheet1_fixture;
+    use std::path::PathBuf;
+
+    #[test]
+    fn terminal_market_paths_continue_after_early_autocall_but_put_is_gated() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/fixture/termsheet1.json");
+        let mut no_call = load_termsheet1_fixture(path).unwrap().request;
+        no_call.config.paths = 512;
+        no_call.config.path_block_size = 128;
+        no_call.trade.knock_out_barrier = None;
+        let no_call_result = price_full_phoenix(&no_call).unwrap();
+
+        let mut early_call = no_call;
+        early_call.trade.knock_out_barrier = Some(1.0e-6);
+        let early_call_result = price_full_phoenix(&early_call).unwrap();
+
+        assert_eq!(
+            early_call_result.ki_probability,
+            no_call_result.ki_probability
+        );
+        assert!(no_call_result.legs.down_and_in_put > 0.0);
+        assert_eq!(early_call_result.legs.down_and_in_put, 0.0);
+    }
+
+    #[test]
+    fn transition_statistics_match_replayed_event_populations() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/fixture/termsheet1.json");
+        let mut request = load_termsheet1_fixture(path).unwrap().request;
+        request.config.paths = 512;
+        request.config.path_block_size = 128;
+        let records = crate::explain::run_paths(&request).unwrap();
+        let result = price_full_phoenix(&request).unwrap();
+
+        let moments = |values: &[f64]| {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance = if values.len() > 1 {
+                values
+                    .iter()
+                    .map(|value| (value - mean).powi(2))
+                    .sum::<f64>()
+                    / (values.len() - 1) as f64
+            } else {
+                0.0
+            };
+            (mean, variance)
+        };
+        let cases = [
+            (
+                "daily_global_ko",
+                records
+                    .iter()
+                    .filter(|record| record.knocked_out)
+                    .map(|record| record.funding)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "final_fixing_eki",
+                records
+                    .iter()
+                    .filter(|record| record.ki_hit)
+                    .map(|record| record.put_payoff)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                "memory_coupon",
+                records
+                    .iter()
+                    .filter(|record| record.coupon_pv > 0.0)
+                    .map(|record| record.coupon_pv)
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        for (id, values) in cases {
+            let stat = result
+                .stats
+                .iter()
+                .find(|stat| stat.transition_id == id)
+                .unwrap();
+            let (mean, variance) = moments(&values);
+            assert_eq!(stat.output_count, values.len() as u64, "{id} count");
+            assert!((stat.mean_payoff - mean).abs() < 1e-12, "{id} mean");
+            assert!(
+                (stat.variance_payoff - variance).abs() < 1e-12,
+                "{id} variance"
+            );
+        }
+
+        let surviving_paths = records.iter().filter(|record| !record.knocked_out).count() as u64;
+        let put_eligible_paths = records
+            .iter()
+            .filter(|record| record.ki_hit && !record.knocked_out)
+            .count() as u64;
+        let put_ledger = result
+            .ledger
+            .iter()
+            .find(|entry| entry.transition_id == "final_fixing_eki_put")
+            .unwrap();
+        assert_eq!(put_ledger.population_before, surviving_paths);
+        assert_eq!(put_ledger.population_after, put_eligible_paths);
+    }
 }

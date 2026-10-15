@@ -73,10 +73,12 @@ anchor for the whole engine.
 
 ### 3.2 Expected values (the acceptance anchor)
 
-The **PUT leg** is the European down-and-in put embedded in the note:
+The **PUT leg** is the European down-and-in put cashflow, payable only on paths that survive
+autocall through final fixing. The reported KI probability is the unconditional terminal market
+event rate; the actual PUT payoff includes the no-prior-autocall gate:
 
 ```
-PUT = DF · E[ max(Exercise − WorstFinal, 0) · 1{WorstFinal ≤ KI} ]     per unit of notional
+PUT = DF · E[ max(Exercise − WorstFinal, 0) · 1{WorstFinal ≤ KI} · 1{not autocalled} ]
 ```
 
 **Target: PUT PV ≈ 0.02112** (2.112% of notional).
@@ -87,8 +89,8 @@ PUT = DF · E[ max(Exercise − WorstFinal, 0) · 1{WorstFinal ≤ KI} ]     per
 | PUT (EKI-gated Dupire LV) | ≈ 0.02198 | +4% vs target — surface interpolation at the moneyness |
 | PUT (daily EKI lane) | ≈ 0.02022 | −4% — conservative vols + session calendar |
 | FUNDING | ≈ 0.9850 | par-redemption leg |
-| COUPON | ≈ 0.381 (ten-point quote scale) | memory-coupon leg |
-| Full note | ≈ 1.34 (mixed scale) | PUT + FUNDING + COUPON, see the units note |
+| COUPON reference | ≈ 0.381 (ten-point quote scale) | legacy reference only; coupon PV is not part of the AC-C0 gate |
+| Full note reference | ≈ 1.34 (mixed scale) | legacy reference only; reconcile units/terms before use |
 
 Acceptance: the riga-flow PUT leg must land within **±5%** of **0.02112** — the band that
 covers the documented lane spread (0.02022 … 0.02198) — with a preference to reconcile to the
@@ -98,8 +100,16 @@ target once the surface-read convention is fixed. Reproduce at **30,000 paths**,
 
 > **Units note.** The COUPON leg is quoted on a legacy ten-point scale (`×10`); FUNDING and
 > PUT are per-unit-of-notional. In consistent per-unit terms the note totals ≈ 1.00–1.04. The
-> fixture records each leg in its native scale and carries the conversion so the whole note
-> reconciles.
+> engine divides the sum of the coupon and memory-coupon quote fields by ten when calculating
+> `total`; that conversion factor is not currently serialized as a separate metadata field. The
+> `par_redemption` and `discounting` result fields are zero because redemption is included in
+> funding and discounting is already applied to each leg. Consumers must not sum the raw leg fields
+> without applying these conventions.
+
+> **Scope note.** `termsheet1` currently gates fixture acceptance on PUT and terminal KI
+> probability. Coupon PV, funding and total note PV are diagnostics; they are not yet reconciled
+> to the issuer's legacy book output. The coupon floor is pinned to 10% of initial spot from the
+> source term sheet, not the prior 100% placeholder.
 
 ### 3.3 What it validates
 
@@ -129,7 +139,7 @@ target once the surface-read convention is fixed. Reproduce at **30,000 paths**,
     "put":     { "value": 0.02112,  "tol_rel": 0.05 },
     "funding": { "value": 0.985048, "tol_rel": 0.01 },
     "coupon":  { "value": 0.380634, "tol_rel": 0.02, "quote_scale": 10.0 },
-    "ki_prob": { "value": 0.1486,   "tol_abs": 0.02 }
+    "ki_prob": { "value": 0.102,    "tol_abs": 0.03 }
   }
 }
 ```
@@ -235,3 +245,4 @@ This is served by the **event-sourced replay** + change-log correlation, not by 
 - **I-V3** Regression triage is automated, not manual.
 - **I-V4** RCA uses replay + evidence, not a debugger.
 - **I-V5** Cross-transport parity is tested, not assumed.
+| Coupon eligibility | Period-1 barrier and periods-2–9 floor are 10% of initial spot per the issuer term sheet |

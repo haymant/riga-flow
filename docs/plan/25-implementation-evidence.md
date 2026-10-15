@@ -1,138 +1,143 @@
 # 25 — Implementation Status & Phase Evidence
 
-> **Status:** integrated CPU engine with **calibrated Dupire local volatility**; local validation
-> passes. Phase exits are classified as **passed for the stated slice**, **partial**, **not met**,
-> or **deferred**. This report supplements [`21-build-plan.md`](21-build-plan.md); it does not
-> waive a normative exit criterion.
+> **Status:** the current branch has a reproducible CPU Phoenix prototype and the captured
+> `termsheet1` **PUT/KI fixture gate passes**. This does not mean every roadmap phase is complete.
+> Status labels distinguish a completed slice from a full phase exit; no unverified production,
+> GPU, transport-parity, or downstream-handoff claim is made here.
 
 ## Scope implemented
 
-The `feat/draftdesign` workspace now contains:
+The `feat/draftdesign` workspace contains:
 
-- `riga-core`: wire types, deterministic content-addressed market snapshot IDs, checked 3-D tensor
-  indexing/serde, trace levels, statistics, attribution, ledger, and uniform errors.
-- `riga-market`: **implied-vol surface + Dupire local-vol calibration** (natural cubic spline in log
-  moneyness, total-variance Dupire formula, dense log-strike grid, clamps), discount curves, an
-  allocation-free `sigma_LV(t, S)` hot lookup, and **correlation matrices + Cholesky**
-  (`CorrelationMatrix::{cholesky, psd_clamp}`, `L·Lᵀ = C`, in-house Jacobi eigenvalues).
-- `riga-engine`: blocked-memory two-asset **GBM and Dupire-LV** propagation; Phoenix proxy legs for
-  daily global KO, coupon accrual/memory, final-fixing EKI, discounted redemption and leg
-  attribution; **correlated-Brownian PathCube generation** (`pathcube.rs`: `Z → Y = L·Z → PathCube`
-  for N factors, `f32` tensors, CRN-reusable); a **graph-composed Phoenix payoff** (`payoff.rs`) executed by the Petri runtime with
-  scan-lowered memory carry; **path reconstruction / replay / PathCube query** (`explain.rs`); a
-  portable **SIMD worst-of kernel** (`simd.rs`); a **CUDA GPU backend** (`gpu.rs`: `cudarc` +
-  NVRTC device-SASS, bit-identical worst-of, resident transfers) behind the `gpu` feature; scans;
-  the graph runtime; and the canonical fixture loader.
-- `riga-risk`: central FD spot/vol/rate/correlation Greeks with CRN, a **CRN variance-reduction
-  measurement**, a **batched FD risk report with DV01 + correlation sensitivity**, a **PnL explain**,
-  and **portfolio aggregation**.
-- `riga-scheduler`: deterministic composition grouping, **scenario cache (LRU)**, **kernel registry**,
-  **cluster-occupancy reporting**, and bounded work-range planning.
-- `riga-cli`: health, fixture pricing, and JSON-stdin request adapters.
-- `riga-mcp`: root-workspace rmcp server with `health`, `price_put`, `price_trade`,
-  `explain_pv_attribution`, `replay_path`, `query_path_cube`, `risk_batch`; stdio and optional
-  Streamable HTTP transports.
-- `docs/fixture/termsheet1.json`: the **captured** fina-risk market (as-of marks, full implied smile,
-  USD curve, resolved correlation) with the local-vol grids.
-- `fixtures/termsheet1.golden.json`: deterministic reference result from the current engine.
+- `riga-core`: request/result wire types, deterministic content-addressed market snapshot IDs,
+  checked 3-D tensors in two layouts, serialization, trace levels, and common error types.
+- `riga-market`: discount curves, implied-volatility surfaces, calibrated Dupire local-vol grids,
+  correlation validation, Cholesky factors, and PSD clamping.
+- `riga-engine`: blocked CPU GBM and Dupire-LV paths; the full-Phoenix **proxy** cashflows
+  (daily global KO, coupon accrual/memory, EKI put, redemption, discounting and leg statistics);
+  correlated Brownian PathCube generation; a standalone Petri-style graph/payoff prototype;
+  scan primitives; SIMD worst-of; path reconstruction, replay, and percentile query; canonical
+  fixture loading. The direct pricing kernel remains the production path; it is not yet orchestrated
+  through the payoff graph.
+- `riga-risk`: CRN central finite-difference scenarios, surface-aware sticky-strike Dupire Vega,
+  DV01/correlation sensitivities, PnL explain, and portfolio aggregation. This is a two-asset
+  prototype, not the 61-scenario production risk engine.
+- `riga-scheduler`: deterministic composition grouping, bounded work-range planning, LRU scenario
+  cache, kernel registry, and occupancy reporting. It is not yet connected to engine dispatch.
+- `riga-cli`: headless JSON CLI.
+- `riga-mcp`: `health`, `price_put`, `price_trade`, `explain_pv_attribution`, `replay_path`,
+  `query_path_cube`, catalog-spelled alias `query_pathcube`, and `risk_batch`, over stdio and
+  optional Streamable HTTP. Resources, prompts, book tasks, progress/cancellation, and transport
+  parity testing remain open.
+- `docs/fixture/termsheet1.json`: captured as-of marks, initial fixing basis, full implied-vol
+  smile and calibrated local-vol inputs, USD curve, dividends, resolved correlation, and the
+  issuer-pinned **10%-of-initial coupon floor**.
 
-## Canonical fixture mapping and measured run
+## Canonical fixture and current measurement
 
-The loader reads [`docs/fixture/termsheet1.json`](../fixture/termsheet1.json): captured as-of marks
-(`267.885 / 258.355`), pinned initial fixings (`239.97 / 260.00`) as the performance basis, the full
-`eqVol` implied smile, the captured USD curve and cash-dividend yields, and the resolved correlation
-(`0.4593248180905`, the captured `marketData.corr` quote). The local-vol grids are calibrated
-per factor and propagated with Euler–Maruyama.
+The loader maps the source fixture's captured as-of spots (`267.885 / 258.355`), pinned initial
+fixings (`239.97 / 260.00`), full `eqVol` smiles, USD curve, cash-dividend yields, correlation
+(`0.4593248180905`), trade economics, and remaining schedule. The source-declared model is Dupire
+local volatility; the current engine executes calibrated CPU Dupire-LV.
 
-Current release run (`paths=30,000`, `seed=1729`, Dupire LV):
+Current release run (`paths=30,000`, `seed=1729`):
 
-| Quantity | Value | Anchor | Diagnostic |
-| --- | ---: | ---: | ---: |
-| **PUT PV** | **0.020329** | 0.02112 | **−3.75%** (band ±5%) |
-| KI probability | 0.1003 | 0.102 (LV lane) | −0.0017 |
-| FUNDING | 0.990092 | 0.985048 | — |
-| Total proxy PV | 0.978999 | — | — |
-| Fixture acceptance | **`passed`** | — | AC-C0 satisfied |
+| Quantity | Measured | Reference / gate | Result |
+| --- | ---: | ---: | --- |
+| **Down-and-in PUT PV** | **0.0203289354** | 0.02112 ±5% | **Pass**, −3.7456% |
+| Terminal KI probability | 0.1127 | 0.102 ±0.03 | Pass, absolute delta 0.0107 |
+| Funding leg | 0.9900923682 | 0.985048 reference | Diagnostic only |
+| Coupon leg | 0.3050120324 | 0.380634 legacy reference | Diagnostic only; unreconciled quote scale |
+| Memory-coupon leg | 0.0000000000 | — | Diagnostic |
+| Total proxy PV | 1.0002646361 | No reconciled source target | Diagnostic only |
+| Monte Carlo standard error | 0.0003784998 | — | Reported by engine |
+| Fixture acceptance | `passed`; `diagnostic_only=false` | PUT and KI tolerances | **Passed** |
 
-The calibrated local vol matches the upstream reference grid at the horizon
-(ADBE `0.4677@180`, `0.4309@268`; AMZN `0.3465@240`, `0.3527@268`).
-
-> **Lane note.** The PUT anchor `0.02112` is the legacy cross-engine number and is unchanged. The
-> upstream `ki_prob` anchor `0.1486` was the *conservative-vol daily lane*; under the captured **smile**
-> (the required model) the EKI rate is `≈ 0.102`, which is now the recorded `ki_prob` expectation. Both
-> lane values are retained in `expected.lane_spread`. The PUT leg is the AC-C0 gate.
+The engine continues underlying paths after autocall so terminal KI probability is an unconditional
+terminal market event rate. The **PUT cashflow is separately gated off** when a path autocalls before
+final fixing. Replay applies the same lifecycle. Coupon PV, funding, and aggregate note PV are not
+acceptance gates and have not been reconciled to the issuer's legacy book values. The coupon floor
+is now source-pinned at 10%; the former 100% placeholder is historical and invalid for current use.
 
 ## Executed local evidence
 
-| Check | Result | Evidence |
-| --- | --- | --- |
-| Formatting | Pass | `cargo fmt --all -- --check` |
-| Strict lint | Pass | `cargo clippy --workspace --all-targets -- -D warnings` |
-| Workspace tests | Pass: **46** unit/integration tests | `cargo test --workspace` (core 4; market 4; engine 20; risk 7; scheduler 7; MCP 3; allocator 1) |
-| Dependency hygiene + no-ui | Pass | `./scripts/dep_hygiene.sh` (CI job `dependency-hygiene`) |
-| Dupire LV calibration vs reference | Pass | `fixture::tests::calibrated_local_vol_matches_the_reference_grid` |
-| Correlation Cholesky + PathCube | Pass | `riga-market` `factor_reconstructs_the_matrix_and_is_lower_triangular`, `non_psd_matrix_is_clamped_to_a_valid_correlation_matrix`; `pathcube::tests::cholesky_z_reproduces_the_target_correlation` (sample ρ within 0.01 of the target) |
-| Fixture acceptance (AC-C0) | **Passed** | `riga price-put docs/fixture/termsheet1.json` → PUT −3.75% |
-| Graph payoff parity | Pass | `payoff::tests::graph_put_matches_the_imperative_reference` (20 seeds, <1e-12) |
-| Memory carry via scan | Pass | `payoff::tests::put_graph_aggregates_leg_stats_and_events`; `randomized_segmented_scans_match_imperative_reference` |
-| Path reconstruction / replay | Pass | `explain::tests::reconstructed_paths_aggregate_to_the_pricing_result` (put/KI match to 1e-12) |
-| PathCube worst-percentile query | Pass | `explain::tests::worst_percentile_query_selects_the_lowest_paths` |
-| CRN variance reduction | Pass | `riga-risk` `crn_reduces_the_delta_estimator_variance` → **137×** |
-| Risk batch + PnL explain | Pass | `batch_risk_reports_all_scenarios_and_aggregates`, `pnl_explain_tracks_a_spot_reprice` |
-| Scheduler occupancy (100k) | Pass | `hundred_thousand_trades_cluster_into_twenty_to_hundred_clusters` (48 clusters, mixed maturity) |
-| Scenario cache / kernel registry | Pass | `scenario_cache_is_lru_and_generates_once_per_key`, `kernel_registry_resolves_by_composition_key` |
-| SIMD parity | Pass | `simd::tests::vectorised_worst_of_is_bit_identical_to_scalar` |
-| SIMD speedup | **Below target** | `cargo run --release -p riga-engine --example simd_bench` → ~1.4× (min over 2 factors is memory-bound; the 3–10× band is not met) |
-| GPU kernel parity | Pass | `cargo test -p riga-engine --features gpu` → worst-of bit-identical to scalar; device **RTX 3060 Ti, sm_86** |
-| GPU loud failure | Pass | `gpu_backend()` initialises a device or returns `gpu_unavailable`; a non-`gpu` build reports the backend disabled |
-| GPU throughput | **Partial** | `cargo run --release -p riga-engine --features gpu --example gpu_bench` → resident worst-of **~20–23×** vs CPU SIMD; per-call H2D/D2H is transfer-bound (slower). LV-propagation/coupon kernels remain |
-| Trace-off allocation gate | Pass | `crates/riga-engine/tests/alloc_free.rs` |
-| MCP tools | Pass | 7 tools advertised; `explain/replay/pathcube/risk_batch/price_trade` exercised over stdio |
-| Golden comparison | Pass within `1e-12` | `termsheet1_golden_matches_structured_result`; repeated-JSON bytes exact |
-| Wall-clock access in pricing | None | explicit request `as_of`; no clock reads |
-| GitHub CI | Not evidenced as remotely run | workflow exists (rust + dependency-hygiene jobs); checks are local |
+`make check` completed successfully on this sandbox. It runs formatting, strict Clippy, the full
+workspace test suite, dependency hygiene/no-UI, and the backend-selection regression.
+
+| Check | Evidence / result |
+| --- | --- |
+| Formatting | Pass — `cargo fmt --all -- --check` |
+| Strict lint | Pass — `cargo clippy --workspace --all-targets -- -D warnings` |
+| Workspace unit/integration tests | **64 passed, 0 failed**: core 4; engine 31; allocator integration 1; market 8; MCP 4; risk 9; scheduler 7 |
+| Dependency hygiene / no UI | Pass — `./scripts/dep_hygiene.sh` |
+| Make backend policy | Pass — current sandbox probe selects CPU; mocked visible device + driver + CUDA 13 NVRTC selects CUDA; `GPU=off` forces CPU; invalid value rejected; `GPU=on build` fails its preflight on this host |
+| Fixture acceptance | **Pass** — release CLI reports PUT −3.7456% from anchor and KI within tolerance |
+| Golden / determinism | Pass — structured JSON comparison within `1e-12`; same envelope repeats identical JSON bytes |
+| Fixture provenance | Pass — source market/economics, coupon floor, remaining schedule, model identity and local-vol reference nodes covered by loader tests |
+| Dupire calibration | Pass for the pinned fixture grid — test matches selected reference points; this is not an independent 1 bp Monte Carlo benchmark |
+| Memory-coupon graph | Pass for tested graph slice — accrued misses plus current coupon; randomized parity and malformed-shape/input checks |
+| Scan primitives | Pass for tested contracts — 1,000 deterministic randomized cases each for `cumsum`, `segmented_scan`, and `masked_scan`; mismatched masked input rejected |
+| Replay / statistics | Pass for tested slice — replayed event populations match counts, means and sample variances; early-KO terminal path parity, gated PUT regression, and PUT-ledger survivor/eligibility populations match replay |
+| Local-vol Vega | Pass for tested convention — sticky-strike parallel implied-vol shift recalibrates the active Dupire surface and reprices |
+| Risk numerical validation | Pass for tested boundaries — invalid bumps, negative down-vol surfaces, unrepresentable spot bumps, boundary correlation and insufficient replicates rejected |
+| CRN variance reduction | Pass — **140.18×** on the current measured delta experiment; not a convergence study or paired-path error bound |
+| Risk batch | Pass for the two-asset slice — 13 distinct base/up/down scenario valuations, CRN seed reuse, DV01/correlation sensitivity and PnL explain |
+| Scheduler | Pass for planner-only gates — 100k trade grouping test reports 48 clusters; no engine dispatch/cache integration benchmark |
+| Tensor layout benchmark | FactorMajor/SoA 21.52 ms vs PathTimeFactor/AoS 38.68 ms; **1.80×** in this run (4,096 paths ×64 times ×3 factors, 20 repetitions) |
+| SIMD benchmark | **1.16×** in this run (1,000,000 worst-of values, 50 repetitions), below the documented 3–10× goal |
+| MCP stdio | Pass — live initialize/tools-list smoke test advertises 8 tools, including both PathCube spellings; fixture and error-shape tests pass |
+| MCP HTTP parity / resources / prompts | **Not evidenced** — server code has optional Streamable HTTP and loopback host protection, but no cross-transport parity, resource/prompt, task progress or cancellation test |
+| CUDA runtime | **Unavailable on this sandbox** — no visible NVIDIA device/CUDA runtime; `make` selected CPU. The auto-selection logic was tested with a mocked capability probe. Prior RTX 3060 Ti kernel evidence is historical and was not revalidated here; no end-to-end GPU Phoenix pricing is claimed. |
+| Remote GitHub CI | Not evidenced as run; workflow now uses `make check` and runs dependency hygiene |
 
 ## Phase exit matrix
 
-“Partial” means concrete gates are covered but one or more required exit criteria remain open.
+“Partial” means this phase has reproducible implementation evidence, but at least one stated exit
+criterion remains open. A row marked “slice passed” does not certify a broader production gate.
 
-| Phase | Exit criterion | Status | Evidence and remaining work |
+| Phase | Exit criteria | Status | Evidence and remaining work |
 | --- | --- | --- | --- |
-| 0 — Foundations & determinism | Workspace, explicit inputs, reproducibility, validation and CI gates | **Partial** | Workspace, pinned toolchain, snapshot ID, byte repeatability, validation, fmt/clippy/tests pass; `dep_hygiene.sh` + `no-ui` added. GitHub CI not remotely run. |
-| 1 — Core types & tensor layout | Checked layouts, correctness, trace-off and measured layout behavior | **Passed for current slice** | Two layout round trips, serde, bounds checks, zero-allocation trace-off helper; 1.75× factor-major traversal. |
-| 2 — GBM + reference validation | Model implementation and fixture/reference acceptance | **Passed for the LV slice** | Captured market pinned; correlation **Cholesky** + PathCube generation implemented; AC-C0 PUT within ±5%. Still no independent QuantLib 1 bp comparison or Sobol benchmark. |
-| 3 — Graph execution runtime | Petri runtime drives the payoff and reproduces its numbers | **Partial** | `payoff.rs` composes worst-of → range-accrual → global-KO → KI → down-and-in-put → aggregate and the memory coupon through scans; parity test vs imperative. The LV/GBM kernel is not yet composed through the graph. |
-| 4 — Scan primitives | Correct inclusive/segmented/masked scans; memory coupon from them | **Partial** | `cumsum`, `segmented_scan`, `masked_scan`, `first_true`; randomized property tests; memory carry lowered to `segmented_scan` in the graph. |
-| 5 — FD Greeks + CRN | Bumps, Greeks, CRN correctness and variance-reduction evidence | **Partial** | Spot/vol/rate/correlation central FD with CRN; **CRN factor 137×** measured. Convergence study and paired-CRN error bounds remain. |
-| 6 — Dupire Local Vol | LV calibration, lookup, and `termsheet1` reconciliation | **Passed for the captured smile** | Calibrated from the captured `eqVol` smile; matches the reference grid; PUT reconciles to −3.75%. Refine to a strike×tenor surface with an independent reference MC for the full 1 bp claim. |
-| 7 — Clustering runtime + scheduler | Composition clusters, scenario cache, occupancy | **Partial** | Composition clustering + **scenario cache (LRU)** + **kernel registry** + occupancy; 100k trades → 48 clusters. Scheduler-to-engine dispatch/cache integration remains. |
-| 8 — SIMD | SIMD kernels + scalar parity + recorded speedup | **Partial** | SSE2 worst-of, bit-identical to scalar. Measured ~1.4× (memory-bound); the 3–10× band is not met. Wider kernels (AVX2) remain. |
-| 9 — GPU path propagation | GPU kernel, throughput, loud-unavailable | **Partial** | Real CUDA backend (`cudarc` + NVRTC device-SASS for the exact arch) on the reference **RTX 3060 Ti (sm_86)**; worst-of kernel bit-identical to scalar; resident throughput ~**20–23×** vs CPU SIMD. `gpu_backend()` initialises the device or fails loudly (no silent CPU fallback). The LV-propagation and coupon GPU kernels, and end-to-end GPU pricing, remain. |
-| 10 — Production risk engine | Batched scenarios, aggregation, book-scale performance | **Partial** | Batched central-FD risk report (13 scenarios for a 2-asset trade) + DV01 + correlation sensitivity + PnL explain + portfolio aggregation. The 61-scenario factor set and 100k-book timing remain. |
-| 11 — Explainability & ledger | Attribution, replay, PathCube query, path reconstruction | **Partial** | Explain Ledger + stats + leg attribution; deterministic replay and single-path reconstruction from identity; worst-percentile PathCube query. PathCube archive persistence remains. |
-| 12 — MCP server | Tools/resources/prompts, transports, progress | **Partial** | 7 tools over stdio + Streamable HTTP with parity. Resources, prompts, progress/cancellation and book/batch tools remain. |
-| 13 — `fina-builder` handoff | Frozen contract and downstream atlas | **Deferred by user request** | Excluded per instruction. |
+| 0 — Foundations & determinism | Explicit inputs, reproducibility, validation, CI | **Partial** | Pinned toolchain, content-addressed snapshot identity, stable seed, validation, local `make check` pass. Remote CI and complete production determinism envelope are not evidenced. |
+| 1 — Core types & tensor layout | Checked layouts, correctness, trace-off and measured behavior | **Partial** | Two layouts, serde, bounds tests, allocation-free trace-off helper and 1.80× factor-major benchmark. Trace-off is not yet wired through the production pricing hot loop. |
+| 2 — GBM + reference validation | Model and independent reference acceptance | **Partial** | CPU GBM/LV and pinned PUT/KI fixture gate pass. Independent QuantLib/1 bp comparison and Sobol/QMC benchmark remain. |
+| 3 — Graph execution runtime | Petri runtime drives the payoff and reproduces all legs | **Partial** | Runtime/payoff graph, typed shape/input guards, and randomized parity for the tested PUT/coupon slice. The production full-note kernel does not run through the graph; graph stats are not a full event-statistics implementation. |
+| 4 — Scan primitives | Correct scans and memory coupon lowered through them | **Partial** | Inclusive, segmented and masked scans pass randomized reference tests; graph memory carry uses segmented scan. Full schedule/lifecycle graph integration and scale/performance proof remain. |
+| 5 — FD Greeks + CRN | Correct scenarios, CRN, convergence and error evidence | **Partial** | Surface-aware Delta/Gamma/Vega, rate and correlation scenarios; 140.18× variance-reduction experiment. Paired path-covariance Greek errors and convergence/stability study remain. |
+| 6 — Dupire Local Vol | Calibration, lookup, market and fixture reconciliation | **Partial** | Captured smile calibrated and selected grid points match; PUT fixture gate passes. Independent CPU reference at the 1 bp target and broader surface checks remain. |
+| 7 — Clustering runtime + scheduler | Clusters, cache, kernel resolution, engine dispatch | **Partial** | Deterministic grouping, LRU cache, kernel registry, bounded planner and 100k grouping test. Scheduler-to-engine dispatch and cache reuse under pricing workload remain. |
+| 8 — SIMD | Parity and 3–10× target | **Partial** | SIMD worst-of is bit-identical to scalar; measured 1.16× in current microbenchmark, below target. Wider AVX2 kernels remain. |
+| 9 — GPU path propagation | GPU propagation, throughput and loud-unavailable behavior | **Partial / hardware blocked here** | Optional CUDA worst-of kernel and a conservative per-host Make selector; this sandbox has no GPU, so runtime parity/throughput was not rerun. GPU LV propagation, coupon kernels and end-to-end GPU pricing remain. |
+| 10 — Production risk engine | 61-scenario factors, aggregation and 100k-book performance | **Partial** | 13-scenario/two-asset CRN report, DV01, correlation sensitivity, PnL explain and aggregation. Full 61-scenario lane and 100k-book timing remain. |
+| 11 — Explainability & ledger | Attribution, replay, snapshots and archive | **Partial** | Leg/ledger output, event-consistent pricing statistics, deterministic replay/path reconstruction and percentile query. Persistent PathCube/run archive and full evidence lineage remain. |
+| 12 — MCP server | Catalog, transports, errors, progress/cancellation | **Partial** | Eight stdio tools, structured errors, PathCube naming alias, optional HTTP transport. Resource/prompt catalog, HTTP/stdio parity, Tasks/progress/cancellation and book tools remain. |
+| 13 — `fina-builder` handoff | Frozen contract and downstream visual atlas | **Deferred by user request** | Intentionally excluded; no handoff integration performed. |
 
-## Open inputs / gates
+## Remaining gates
 
-1. Complete the graph→kernel orchestration (compose the LV pricer through the graph runtime).
-2. Add AVX2/wider SIMD kernels and an independent CPU/QuantLib reference for the 1 bp claim.
-3. Extend the GPU backend to the LV-propagation and coupon kernels and end-to-end GPU pricing
-   (the worst-of kernel is implemented and bit-identical).
-4. Expand the risk batch to the full 61-scenario factor set and add 100k-book timing.
-5. Add MCP resources/prompts, progress/cancellation, and keep the `fina-builder` handoff deferred.
+1. Compose the **production** full-Phoenix kernel through the payoff graph and return/reconcile all
+   legs with consistent units and event populations.
+2. Wire `TraceLevel::Off` through the production hot loop; implement meaningful graph transition
+   statistics rather than treating shape retention as event probability.
+3. Add independent CPU/QuantLib reference checks, paired-CRN covariance errors, convergence and
+   scenario stability evidence; expand risk to the complete 61-factor set.
+4. Connect scheduler/cache to actual engine batches and measure 100k-book time/memory.
+5. Add wider SIMD and meet or explicitly revise the 3–10× performance target.
+6. Extend CUDA to local-vol propagation and coupon/full-note pricing. A device-equipped runner is
+   required to verify GPU parity/throughput; this sandbox correctly stays CPU-only by default.
+7. Add MCP resources/prompts, HTTP/stdio parity, task progress/cancellation, book tools, and full
+   determinism/evidence envelopes.
+8. Reconcile coupon/funding/total PV quote scales with the issuer's legacy values. PUT/KI pass does
+   not imply full-note PV acceptance.
+9. Keep the `fina-builder` handoff deferred until separately requested.
 
 ## Reproduction
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-./scripts/dep_hygiene.sh
-cargo run --release -q -p riga-cli -- price-put docs/fixture/termsheet1.json
-cargo run --release -q -p riga-engine --example simd_bench
+make info
+make check
+make fixture
 cargo run --release -q -p riga-engine --example layout_bench
-cargo test -p riga-engine --features gpu
-cargo run --release -p riga-engine --features gpu --example gpu_bench
-cargo run -p riga-mcp -- --transport stdio
+cargo run --release -q -p riga-engine --example simd_bench
+# Hardware-dependent; only on a host with NVIDIA driver + CUDA 13 NVRTC:
+make GPU=on gpu-test
 ```

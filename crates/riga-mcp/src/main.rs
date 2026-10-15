@@ -154,7 +154,10 @@ impl RigaMcp {
             explain::reconstruct_path(&fixture.request, params.path_id)
                 .map_err(ToolError::from_engine)
         }) {
-            Ok(record) => structured_success(serde_json::to_value(record).unwrap_or(Value::Null)),
+            Ok(record) => match serde_json::to_value(record) {
+                Ok(value) => structured_success(value),
+                Err(error) => structured_error("serialization_error", error.to_string()),
+            },
             Err(error) => structured_error(error.code, error.message),
         }
     }
@@ -168,7 +171,27 @@ impl RigaMcp {
             explain::query_worst_percentile(&fixture.request, params.percentile, params.max_sample)
                 .map_err(ToolError::from_engine)
         }) {
-            Ok(query) => structured_success(serde_json::to_value(query).unwrap_or(Value::Null)),
+            Ok(query) => match serde_json::to_value(query) {
+                Ok(value) => structured_success(value),
+                Err(error) => structured_error("serialization_error", error.to_string()),
+            },
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Compatibility spelling for query_path_cube: return the worst `percentile` of simulated paths by final worst-of performance."
+    )]
+    fn query_pathcube(&self, Parameters(params): Parameters<PathCubeParams>) -> CallToolResult {
+        let path = self.resolve(&params.fixture_path);
+        match load_fixture(&path).and_then(|fixture| {
+            explain::query_worst_percentile(&fixture.request, params.percentile, params.max_sample)
+                .map_err(ToolError::from_engine)
+        }) {
+            Ok(query) => match serde_json::to_value(query) {
+                Ok(value) => structured_success(value),
+                Err(error) => structured_error("serialization_error", error.to_string()),
+            },
             Err(error) => structured_error(error.code, error.message),
         }
     }
@@ -536,6 +559,22 @@ mod tests {
         let wire = json!({"code": error.code, "message": error.message});
         assert!(wire["code"].is_string());
         assert!(wire["message"].is_string());
+    }
+
+    #[test]
+    fn query_pathcube_catalog_alias_matches_query_path_cube() {
+        let server = RigaMcp::new(default_fixture_path());
+        let params = || {
+            Parameters(PathCubeParams {
+                fixture_path: Some("/missing/termsheet1.json".into()),
+                percentile: 0.05,
+                max_sample: 4,
+            })
+        };
+        let canonical = server.query_path_cube(params());
+        let alias = server.query_pathcube(params());
+        assert_eq!(canonical.structured_content, alias.structured_content);
+        assert_eq!(canonical.is_error, alias.is_error);
     }
 
     #[test]

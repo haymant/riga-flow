@@ -27,6 +27,31 @@ pub struct PayoffSpec {
 }
 
 impl PayoffSpec {
+    fn check_input_count(inputs: &[&PlaceValue], expected: usize) -> Result<(), RigaError> {
+        if inputs.len() != expected {
+            return Err(RigaError::new(
+                "input_count_mismatch",
+                format!("expected {expected} inputs, got {}", inputs.len()),
+            ));
+        }
+        Ok(())
+    }
+
+    fn point_count(&self) -> Result<usize, RigaError> {
+        if self.paths == 0 || self.times == 0 {
+            return Err(RigaError::new(
+                "invalid_shape",
+                "payoff paths and times must both be positive",
+            ));
+        }
+        self.paths.checked_mul(self.times).ok_or_else(|| {
+            RigaError::new(
+                "invalid_shape",
+                "payoff path-time dimensions overflow usize",
+            )
+        })
+    }
+
     fn check_len(&self, value: &PlaceValue, expected: usize) -> Result<(), RigaError> {
         if value.len() != expected {
             return Err(RigaError::new(
@@ -62,7 +87,13 @@ impl Transition for WorstOf {
         "worst"
     }
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError> {
-        let n = self.spec.paths * self.spec.times;
+        let n = self.spec.point_count()?;
+        if inputs.is_empty() {
+            return Err(RigaError::new(
+                "invalid_factor_count",
+                "worst-of requires at least one factor",
+            ));
+        }
         let factors: Vec<&Vec<f64>> = inputs
             .iter()
             .map(|v| {
@@ -96,6 +127,9 @@ impl Transition for RangeAccrual {
         "coupon_mask"
     }
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError> {
+        PayoffSpec::check_input_count(inputs, 1)?;
+        let n = self.spec.point_count()?;
+        self.spec.check_len(inputs[0], n)?;
         let worst = f64s(inputs[0])?;
         Ok(PlaceValue::Bool(
             worst
@@ -122,6 +156,9 @@ impl Transition for GlobalKo {
         "ko_period"
     }
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError> {
+        PayoffSpec::check_input_count(inputs, 1)?;
+        let n = self.spec.point_count()?;
+        self.spec.check_len(inputs[0], n)?;
         let worst = f64s(inputs[0])?;
         let (paths, times) = (self.spec.paths, self.spec.times);
         let mut out = vec![u64::MAX; paths];
@@ -153,6 +190,9 @@ impl Transition for KnockIn {
         "ki_flag"
     }
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError> {
+        PayoffSpec::check_input_count(inputs, 1)?;
+        let n = self.spec.point_count()?;
+        self.spec.check_len(inputs[0], n)?;
         let worst = f64s(inputs[0])?;
         let (paths, times) = (self.spec.paths, self.spec.times);
         Ok(PlaceValue::Bool(
@@ -179,6 +219,10 @@ impl Transition for DownAndInPut {
         "put"
     }
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError> {
+        PayoffSpec::check_input_count(inputs, 2)?;
+        let n = self.spec.point_count()?;
+        self.spec.check_len(inputs[0], n)?;
+        self.spec.check_len(inputs[1], self.spec.paths)?;
         let worst = f64s(inputs[0])?;
         let PlaceValue::Bool(ki) = inputs[1] else {
             return Err(RigaError::new("type_mismatch", "expected bool KI flag"));
@@ -216,6 +260,12 @@ impl Transition for Mean {
         self.output
     }
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError> {
+        if inputs.len() != 1 {
+            return Err(RigaError::new(
+                "input_count_mismatch",
+                format!("expected one input, got {}", inputs.len()),
+            ));
+        }
         let values = f64s(inputs[0])?;
         let mean = if values.is_empty() {
             0.0
@@ -230,7 +280,8 @@ impl Transition for Mean {
 ///
 /// Inputs are the range-accrual mask and the KO period. A path accrues
 /// `coupon_rate` per eligible period and remembers missed periods until the next
-/// eligible one; the scan resets at each payment.
+/// eligible one; the scan resets at each payment. Reset positions emit zero, so a
+/// payment uses the prefix through the previous timestep plus its current coupon.
 pub struct MemoryCoupon {
     pub inputs: Vec<String>,
     pub spec: PayoffSpec,
@@ -246,6 +297,10 @@ impl Transition for MemoryCoupon {
         "coupon_pv"
     }
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError> {
+        PayoffSpec::check_input_count(inputs, 2)?;
+        let n = self.spec.point_count()?;
+        self.spec.check_len(inputs[0], n)?;
+        self.spec.check_len(inputs[1], self.spec.paths)?;
         let PlaceValue::Bool(mask) = inputs[0] else {
             return Err(RigaError::new("type_mismatch", "expected coupon mask"));
         };
@@ -256,9 +311,9 @@ impl Transition for MemoryCoupon {
         let rate = self.spec.coupon_rate;
         let discount = self.spec.discount;
         let mut out = vec![0.0; paths];
-        // values are 0/1 eligible; reset marks a payment. `segmented_scan` accumulates
-        // the length of the current run and resets at each payment — the lowered
-        // `CS → MC → CS` cycle.
+        // Values are one for each alive, missed coupon observation. A reset is placed
+        // on a payment (or after KO); the reset position emits zero, so the payment
+        // reads the prefix at t-1 and adds its current coupon explicitly.
         let mut values = vec![0u32; times];
         let mut reset = vec![false; times];
         for path in 0..paths {
@@ -266,15 +321,15 @@ impl Transition for MemoryCoupon {
             for t in 0..times {
                 let alive = (t as u64) < ko;
                 let eligible = mask[path * times + t] && alive;
-                values[t] = u32::from(eligible);
+                values[t] = u32::from(alive && !eligible);
                 reset[t] = eligible || !alive;
             }
             let scanned = segmented_scan(&values, &reset)?;
-            // Each eligible period pays `scanned(periods since last payment) * rate`.
             let mut pv = 0.0;
             for t in 0..times {
-                if values[t] == 1 {
-                    pv += scanned[t] as f64 * rate * discount;
+                if mask[path * times + t] && (t as u64) < ko {
+                    let missed = if t == 0 { 0 } else { scanned[t - 1] };
+                    pv += (missed as f64 + 1.0) * rate * discount;
                 }
             }
             out[path] = pv;
@@ -416,5 +471,138 @@ mod tests {
         assert_eq!(report.stats.len(), 8);
         assert!(report.places.contains_key("ko_period"));
         assert!(report.places.contains_key("coupon_pv_mean"));
+    }
+
+    fn imperative_memory_coupon(mask: &[bool], ko: u64, spec: &PayoffSpec) -> f64 {
+        let mut missed = 0u32;
+        let mut pv = 0.0;
+        for (t, eligible) in mask.iter().copied().enumerate() {
+            if t as u64 >= ko {
+                break;
+            }
+            if eligible {
+                pv += (missed as f64 + 1.0) * spec.coupon_rate * spec.discount;
+                missed = 0;
+            } else {
+                missed += 1;
+            }
+        }
+        pv
+    }
+
+    #[test]
+    fn memory_coupon_matches_imperative_reference_randomized() {
+        for seed in 0..40u64 {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let mut spec = spec();
+            spec.paths = 1 + rng.random_range(0..16);
+            spec.times = 1 + rng.random_range(0..32);
+            let mask: Vec<bool> = (0..spec.paths * spec.times)
+                .map(|_| rng.random_bool(0.55))
+                .collect();
+            let kos: Vec<u64> = (0..spec.paths)
+                .map(|_| match rng.random_range(0..=spec.times) {
+                    t if t == spec.times => u64::MAX,
+                    t => t as u64,
+                })
+                .collect();
+            let transition = MemoryCoupon {
+                inputs: vec!["coupon_mask".into(), "ko_period".into()],
+                spec,
+            };
+            let mask_place = PlaceValue::Bool(mask.clone());
+            let ko_place = PlaceValue::U64(kos.clone());
+            let actual = transition.execute(&[&mask_place, &ko_place]).unwrap();
+            let PlaceValue::F64(actual) = actual else {
+                panic!("memory coupon must produce f64 values")
+            };
+            for path in 0..spec.paths {
+                let start = path * spec.times;
+                let expected =
+                    imperative_memory_coupon(&mask[start..start + spec.times], kos[path], &spec);
+                assert!(
+                    (actual[path] - expected).abs() < 1e-12,
+                    "seed {seed}, path {path}: got {}, expected {expected}",
+                    actual[path]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn memory_coupon_pays_current_coupon_and_accumulated_misses() {
+        let mut spec = spec();
+        spec.paths = 1;
+        spec.times = 4;
+        let transition = MemoryCoupon {
+            inputs: vec!["coupon_mask".into(), "ko_period".into()],
+            spec,
+        };
+        let mask = PlaceValue::Bool(vec![false, false, true, true]);
+        let ko = PlaceValue::U64(vec![u64::MAX]);
+        let PlaceValue::F64(pv) = transition.execute(&[&mask, &ko]).unwrap() else {
+            panic!("memory coupon must produce f64 values")
+        };
+        let expected = 4.0 * spec.coupon_rate * spec.discount;
+        assert!((pv[0] - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn payoff_transitions_reject_invalid_shapes_without_panicking() {
+        let spec = spec();
+        let short = PlaceValue::F64(vec![1.0]);
+        assert_eq!(
+            RangeAccrual {
+                input: "x".into(),
+                spec
+            }
+            .execute(&[])
+            .unwrap_err()
+            .code,
+            "input_count_mismatch"
+        );
+        assert_eq!(
+            RangeAccrual {
+                input: "x".into(),
+                spec
+            }
+            .execute(&[&short])
+            .unwrap_err()
+            .code,
+            "shape_mismatch"
+        );
+        assert_eq!(
+            KnockIn {
+                input: "x".into(),
+                spec
+            }
+            .execute(&[&short])
+            .unwrap_err()
+            .code,
+            "shape_mismatch"
+        );
+        let mask = PlaceValue::Bool(vec![false; spec.paths * spec.times]);
+        let short_ko = PlaceValue::U64(vec![0]);
+        assert_eq!(
+            MemoryCoupon {
+                inputs: vec!["mask".into(), "ko".into()],
+                spec,
+            }
+            .execute(&[&mask, &short_ko])
+            .unwrap_err()
+            .code,
+            "shape_mismatch"
+        );
+        let empty_spec = PayoffSpec { times: 0, ..spec };
+        assert_eq!(
+            KnockIn {
+                input: "x".into(),
+                spec: empty_spec,
+            }
+            .execute(&[&short])
+            .unwrap_err()
+            .code,
+            "invalid_shape"
+        );
     }
 }

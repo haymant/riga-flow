@@ -539,6 +539,52 @@ mod tests {
     }
 
     #[test]
+    fn randomized_cumsums_match_imperative_reference() {
+        let mut rng = ChaCha8Rng::seed_from_u64(4815);
+        for _case in 0..1_000 {
+            let len = (rng.random::<u8>() % 64) as usize;
+            let values: Vec<u32> = (0..len).map(|_| rng.random_range(0..32)).collect();
+            let actual = cumsum(&values);
+            let mut running = 0_u64;
+            let expected: Vec<u64> = values
+                .iter()
+                .map(|&value| {
+                    running += u64::from(value);
+                    running
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn randomized_masked_scans_match_imperative_reference() {
+        let mut rng = ChaCha8Rng::seed_from_u64(4816);
+        for _case in 0..1_000 {
+            let len = (rng.random::<u8>() % 64) as usize;
+            let values: Vec<u32> = (0..len).map(|_| rng.random_range(0..32)).collect();
+            let active: Vec<bool> = (0..len).map(|_| rng.random_ratio(1, 2)).collect();
+            let actual = masked_scan(&values, &active).unwrap();
+            let mut running = 0_u64;
+            let expected: Vec<u64> = values
+                .iter()
+                .zip(&active)
+                .map(|(&value, &is_active)| {
+                    if is_active {
+                        running += u64::from(value);
+                        running
+                    } else {
+                        running = 0;
+                        0
+                    }
+                })
+                .collect();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(masked_scan(&[1], &[]).unwrap_err().code, "shape_mismatch");
+    }
+
+    #[test]
     fn invalid_barrier_inputs_have_uniform_error_shape() {
         let mut request = fixture().request;
         request.market.correlation[0][1] = 2.0;

@@ -92,9 +92,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                 let z1_independent: f64 = rng.sample(StandardNormal);
                 let mut shocks = [0.0f64; 2];
                 chol.apply_into(&[z0, z1_independent], &mut shocks);
-                if knocked_out {
-                    continue;
-                }
+                let note_is_active = !knocked_out;
                 let time = (step + 1) as f64 * dt;
                 for factor in 0..2 {
                     let vol = match &local_vol {
@@ -108,6 +106,9 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                 let worst = (spots[0] / request.trade.initial_spots[0])
                     .min(spots[1] / request.trade.initial_spots[1]);
                 final_worst = worst;
+                if !note_is_active {
+                    continue;
+                }
 
                 let period = ((step * periods) / steps).min(periods - 1);
                 if period != current_period {
@@ -174,7 +175,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
             let discount_redemption = (-rate * redemption_time).exp();
             let funding = discount_redemption;
             let hit_ki = final_worst <= request.trade.knock_in_barrier;
-            let put = if hit_ki {
+            let put = if hit_ki && !knocked_out {
                 (request.trade.strike - final_worst).max(0.0)
                     * (-rate * request.trade.maturity_years).exp()
             } else {
@@ -290,6 +291,27 @@ mod tests {
             result.legs.down_and_in_put
         );
         assert!((ki - result.ki_probability).abs() < 1e-12);
+    }
+
+    #[test]
+    fn replay_continues_terminal_market_path_after_autocall() {
+        let mut no_call = request();
+        no_call.trade.knock_out_barrier = None;
+        let no_call_records = super::run_paths(&no_call).unwrap();
+
+        let mut early_call = no_call.clone();
+        early_call.trade.knock_out_barrier = Some(1.0e-6);
+        let early_records = super::run_paths(&early_call).unwrap();
+        assert_eq!(no_call_records.len(), early_records.len());
+        assert!(no_call_records.iter().any(|record| record.put_payoff > 0.0));
+
+        for (base, called) in no_call_records.iter().zip(&early_records) {
+            assert_eq!(base.identity.path_id, called.identity.path_id);
+            assert_eq!(base.worst_final, called.worst_final);
+            assert_eq!(base.ki_hit, called.ki_hit);
+            assert!(called.knocked_out);
+            assert_eq!(called.put_payoff, 0.0);
+        }
     }
 
     #[test]

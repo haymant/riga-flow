@@ -1,6 +1,6 @@
 # termsheet1 — PUT PV reconciliation investigation
 
-> **Status:** investigation record (not a fixture, not a threshold pass).
+> **Status:** historical market-input investigation; the ladder below predates the captured local-vol fixture and is not the current acceptance result.
 > **Question:** the shipped proxy PUT PV is **0.01122**; the pinned anchor is
 > **≈ 0.02112**. What has to change to bring it close?
 > **Answer:** two placeholder defects — the **spot start** and the **vol read** — both
@@ -10,6 +10,27 @@
 > **Engine:** `feat/draftdesign`, release build, 30,000 paths, seed 1729, AAD off.
 > **Note:** this document does **not** edit [`termsheet1.json`](termsheet1.json). It shows the
 > path to reconcile; pinning the captured market is a separate, deliberate fixture change.
+
+## 0. Current canonical fixture status (2026-10-15)
+
+The machine fixture is now captured in [`termsheet1.json`](termsheet1.json), including the
+as-of market, calibrated Dupire local-vol inputs, resolved correlation, and issuer-pinned coupon
+floor of **10% of initial spot**. The engine continues the underlying market path to maturity for
+terminal KI diagnostics, but the EKI PUT cashflow is gated off for paths already autocalled.
+
+Current release run (`paths=30,000`, `seed=1729`):
+
+| Measure | Current | Reference | Status |
+| --- | ---: | ---: | --- |
+| PUT PV | **0.020329** | 0.02112 ±5% | **Pass** (−3.75%) |
+| Terminal KI probability | 0.1127 | 0.102 ±0.03 | Pass |
+| Funding | 0.990092 | 0.985048 | Diagnostic; not an acceptance gate |
+| Coupon (ten-point quote scale) | 0.305012 | 0.380634 | Diagnostic; not reconciled |
+| Total note PV | 1.000265 | — | Diagnostic; mixed legacy quote scale |
+
+The table in §§2–6 is retained as historical context. Its shipped-proxy baseline, 100% coupon
+barrier assumption, and configuration ladder must not be substituted for the current captured
+fixture or its source-pinned 10% coupon floor.
 
 ## 1. What was copied in
 

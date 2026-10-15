@@ -12,9 +12,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: make info
+      - run: make check
       - name: Ensure adapters do not contain pricing kernels
         run: '! grep -R -nE "StandardNormal|knock_in_barrier|\.exp\(\)" crates/riga-cli/src'
 

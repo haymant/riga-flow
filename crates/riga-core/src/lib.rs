@@ -175,6 +175,13 @@ impl Tensor3 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// PV components for the current Phoenix proxy.
+///
+/// `coupon` and `memory_coupon` are reported on a legacy ten-point quote scale; the engine divides
+/// their sum by ten when computing `total`. `funding`, `down_and_in_put`, and `total` are per-unit
+/// of notional. In this proxy, redemption is included in `funding`, so `par_redemption` is zero;
+/// discounting is applied in each leg, so the separate `discounting` field is zero. Do not sum the
+/// raw fields without applying these conventions.
 pub struct LegAttribution {
     pub par_redemption: f64,
     pub coupon: f64,

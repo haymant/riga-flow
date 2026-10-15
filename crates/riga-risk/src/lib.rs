@@ -1,8 +1,9 @@
 //! Common-random-number finite-difference risk for the current riga Phoenix GBM proxy.
 //!
 //! This crate intentionally has a narrow scope. It bumps `MarketSnapshot` inputs and calls
-//! `riga_engine::price_put_leg`; it does not provide the 61-scenario production risk engine,
-//! shared tensor bump batches, or a calibrated Dupire local-volatility implementation.
+//! `riga_engine::price_put_leg` for the current two-factor flat-GBM or calibrated Dupire path; it
+//! does not provide the 61-scenario production risk engine, shared Brownian-block tensor batches,
+//! or scheduler-integrated book risk.
 
 use riga_core::{PriceResult, RigaError};
 use riga_engine::{PriceRequest, price_put_leg};
@@ -25,6 +26,7 @@ pub struct CentralDifferenceConfig {
     /// Relative spot bump. For asset spot `S`, scenarios are `S * (1 +/- bump)`.
     pub spot_relative_bump: f64,
     /// Absolute volatility bump. For volatility `sigma`, scenarios are `sigma +/- bump`.
+    /// With local vol enabled this is a parallel implied-vol shift at fixed strikes (sticky strike).
     pub volatility_absolute_bump: f64,
     /// Absolute rate bump (a parallel shift) used for DV01.
     pub rate_absolute_bump: f64,
@@ -105,8 +107,9 @@ pub struct RiskReport {
 /// Price central finite-difference Delta, Gamma, and Vega with common random numbers.
 ///
 /// The request is never mutated. Each scenario starts the engine's reproducible random stream
-/// from the original `request.config.seed`, while changing exactly one spot or volatility input.
-/// This is CRN because the current engine generates a deterministic path sequence from that seed.
+/// from the original `request.config.seed`, while changing exactly one spot or volatility factor.
+/// Under local vol, Vega is a parallel implied-vol shift at fixed strikes (sticky strike), followed
+/// by recalibration of the Dupire grid for that factor.
 ///
 /// `FiniteDifferenceEstimate::mc_error_upper_bound` conservatively propagates the aggregate
 /// standard errors returned by the current engine. Exact paired-CRN Greek errors are unavailable
@@ -132,10 +135,10 @@ pub fn price_central_greeks(
             down: price_with_common_seed(&spot_down, seed)?,
         };
 
-        let mut vol_up = request.clone();
-        let mut vol_down = request.clone();
-        vol_up.market.vols[asset_index] += config.volatility_absolute_bump;
-        vol_down.market.vols[asset_index] -= config.volatility_absolute_bump;
+        let vol_up =
+            bump_volatility_request(request, asset_index, config.volatility_absolute_bump)?;
+        let vol_down =
+            bump_volatility_request(request, asset_index, -config.volatility_absolute_bump)?;
         let volatility_scenarios = BumpPair {
             up: price_with_common_seed(&vol_up, seed)?,
             down: price_with_common_seed(&vol_down, seed)?,
@@ -189,6 +192,27 @@ fn price_with_common_seed(request: &PriceRequest, seed: u64) -> Result<PriceResu
     price_put_leg(&scenario)
 }
 
+fn bump_volatility_request(
+    request: &PriceRequest,
+    asset_index: usize,
+    bump: f64,
+) -> Result<PriceRequest, RigaError> {
+    let mut scenario = request.clone();
+    scenario.market.vols[asset_index] += bump;
+    if let Some(surface) = &mut scenario.local_vol {
+        let grid = surface.grids.get_mut(asset_index).ok_or_else(|| {
+            RigaError::new(
+                "risk_surface_shape",
+                format!("local-vol grid missing for asset {asset_index}"),
+            )
+        })?;
+        for value in grid.vols.iter_mut().flatten() {
+            *value += bump;
+        }
+    }
+    Ok(scenario)
+}
+
 fn sample_variance(values: &[f64]) -> f64 {
     if values.len() < 2 {
         return 0.0;
@@ -210,6 +234,12 @@ pub fn crn_variance_reduction_factor(
     replicates: usize,
 ) -> Result<f64, RigaError> {
     validate_configuration(request, config)?;
+    if replicates < 2 {
+        return Err(RigaError::new(
+            "risk_replicates_required",
+            "at least two independent replicates are required to estimate a variance ratio",
+        ));
+    }
     let asset = 0usize;
     let h = request.market.spots[asset] * config.spot_relative_bump;
     let mut crn = Vec::with_capacity(replicates);
@@ -231,11 +261,13 @@ pub fn crn_variance_reduction_factor(
     }
     let crn_var = sample_variance(&crn);
     let ind_var = sample_variance(&independent);
-    Ok(if crn_var > 0.0 {
-        ind_var / crn_var
-    } else {
-        f64::INFINITY
-    })
+    if !crn_var.is_finite() || crn_var <= 0.0 {
+        return Err(RigaError::new(
+            "zero_crn_variance",
+            "CRN replicate variance must be positive to report a variance-reduction ratio",
+        ));
+    }
+    Ok(ind_var / crn_var)
 }
 
 fn validate_configuration(
@@ -284,6 +316,25 @@ fn validate_configuration(
             "spot and volatility arrays must be non-empty and have the same length",
         ));
     }
+    if request.market.spots.len() != 2
+        || request.market.correlation.len() != 2
+        || request.market.correlation.iter().any(|row| row.len() != 2)
+    {
+        return Err(RigaError::new(
+            "risk_input_shape",
+            "the current risk lane requires exactly two assets and a 2x2 correlation matrix",
+        ));
+    }
+    let rho = request.market.correlation[0][1];
+    if !rho.is_finite()
+        || (rho - config.correlation_absolute_bump) <= -1.0
+        || (rho + config.correlation_absolute_bump) >= 1.0
+    {
+        return Err(RigaError::new(
+            "invalid_correlation_bump",
+            "correlation up/down scenarios must remain strictly inside (-1, 1)",
+        ));
+    }
     for (asset_index, (&spot, &volatility)) in request
         .market
         .spots
@@ -297,12 +348,43 @@ fn validate_configuration(
                 format!("spot[{asset_index}] must be finite and positive"),
             ));
         }
+        let h = spot * config.spot_relative_bump;
+        if !h.is_finite() || h == 0.0 || spot - h <= 0.0 {
+            return Err(RigaError::new(
+                "invalid_spot_bump",
+                format!("spot bump for asset {asset_index} is not representable and positive"),
+            ));
+        }
         if !volatility.is_finite() || volatility < config.volatility_absolute_bump {
             return Err(RigaError::new(
                 "invalid_volatility_bump",
                 format!(
                     "volatility[{asset_index}] must be finite and at least volatility_absolute_bump"
                 ),
+            ));
+        }
+    }
+    if request.config.paths < 2 {
+        return Err(RigaError::new(
+            "risk_paths_required",
+            "at least two paths are required to report Monte Carlo risk uncertainty",
+        ));
+    }
+    if let Some(surface) = &request.local_vol {
+        let valid_nodes = surface.grids.len() == request.market.spots.len()
+            && surface.grids.iter().all(|grid| {
+                !grid.vols.is_empty()
+                    && grid.vols.iter().all(|row| {
+                        !row.is_empty()
+                            && row.iter().all(|value| {
+                                value.is_finite() && *value >= config.volatility_absolute_bump
+                            })
+                    })
+            });
+        if !valid_nodes {
+            return Err(RigaError::new(
+                "invalid_volatility_bump",
+                "local-vol surface must align with assets and every implied-vol node must remain non-negative under the down bump",
             ));
         }
     }
@@ -372,8 +454,10 @@ pub fn price_risk_batch(
 ) -> Result<BatchRiskReport, RigaError> {
     validate_configuration(request, config)?;
     let seed = request.config.seed;
-    let base = price_with_common_seed(request, seed)?;
     let greeks = price_central_greeks(request, config)?;
+    // The central-Greek pass already prices the base case; reuse it so scenario_count reflects
+    // actual engine evaluations rather than an accidental duplicate valuation.
+    let base = &greeks.base_price;
     let assets = greeks
         .assets
         .iter()
@@ -634,6 +718,77 @@ mod tests {
         assert!(
             factor > 1.5,
             "CRN should materially reduce the FD delta variance, factor={factor:.2}"
+        );
+    }
+
+    #[test]
+    fn local_vol_vega_reprices_a_parallel_sticky_strike_surface_shift() {
+        let request = small_termsheet_request();
+        let config = CentralDifferenceConfig::default();
+        let report = price_central_greeks(&request, &config).unwrap();
+        let asset = &report.assets[0];
+        let bump = config.volatility_absolute_bump;
+
+        let mut direct_up = request.clone();
+        direct_up.market.vols[0] += bump;
+        for value in direct_up.local_vol.as_mut().unwrap().grids[0]
+            .vols
+            .iter_mut()
+            .flatten()
+        {
+            *value += bump;
+        }
+        let mut direct_down = request.clone();
+        direct_down.market.vols[0] -= bump;
+        for value in direct_down.local_vol.as_mut().unwrap().grids[0]
+            .vols
+            .iter_mut()
+            .flatten()
+        {
+            *value -= bump;
+        }
+        assert_eq!(
+            asset.volatility_scenarios.up,
+            price_put_leg(&direct_up).unwrap()
+        );
+        assert_eq!(
+            asset.volatility_scenarios.down,
+            price_put_leg(&direct_down).unwrap()
+        );
+        assert!(asset.vega.value.abs() > 1e-8);
+    }
+
+    #[test]
+    fn rejects_unrepresentable_spot_bumps_single_path_risk_and_too_few_variance_replicates() {
+        let config = CentralDifferenceConfig::default();
+        let mut request = small_termsheet_request();
+        request.market.spots[0] = f64::from_bits(1);
+        assert_eq!(
+            price_central_greeks(&request, &config).unwrap_err().code,
+            "invalid_spot_bump"
+        );
+
+        let mut request = small_termsheet_request();
+        request.config.paths = 1;
+        assert_eq!(
+            price_central_greeks(&request, &config).unwrap_err().code,
+            "risk_paths_required"
+        );
+
+        let request = small_termsheet_request();
+        assert_eq!(
+            crn_variance_reduction_factor(&request, &config, 1)
+                .unwrap_err()
+                .code,
+            "risk_replicates_required"
+        );
+
+        let mut request = small_termsheet_request();
+        request.market.correlation[0][1] = 0.995;
+        request.market.correlation[1][0] = 0.995;
+        assert_eq!(
+            price_central_greeks(&request, &config).unwrap_err().code,
+            "invalid_correlation_bump"
         );
     }
 
