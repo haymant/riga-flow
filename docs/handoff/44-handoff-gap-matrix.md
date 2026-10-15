@@ -116,6 +116,10 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
   progress (`TaskContext::set_status_message`) and honours cancellation
   (`is_cancel_requested`); `tasks/get|update|cancel` implemented.
 - **stdio ↔ HTTP parity** — `skills/riga-flow/scripts/check_mcp_parity.py` (PASS).
+- **TLS + OAuth (delegated)** — `riga-mcp`'s Streamable HTTP is a plaintext loopback service; remote
+  exposure relies on a **reverse proxy / API gateway** for TLS termination and OAuth 2.0 / OIDC
+  (documented in [`../mcp/30-mcp-server-design.md`](../mcp/30-mcp-server-design.md) §3.2). No native
+  TLS/OAuth in the engine by design.
 - **Frozen JSON-Schema snapshot** — the exact tool catalogue (name + description + input schema)
   is pinned by **SHA-256** in a CI test (`TOOL_SCHEMA_SHA256`); changes require a deliberate bump
   (invariant I-HC5).

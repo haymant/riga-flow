@@ -65,6 +65,15 @@ isolation, easy to sandbox. This mirrors `fina-builder`'s `fina-mcp` stdio sidec
   allowed-host list.
 - Optional OAuth 2.0 (`auth` feature) for hosted deployments.
 
+> **Deployment boundary (normative).** `riga-mcp`'s Streamable HTTP transport is a **plaintext
+> loopback service**; it intentionally ships **no native TLS and no OAuth**. A remote deployment
+> MUST front it with a **reverse proxy / API gateway** that terminates **TLS** and performs
+> **OAuth 2.0 / OIDC** authentication and authorisation (for example nginx/Envoy + an
+> OAuth2-proxy or an API gateway with JWT validation), forwarding to `riga-mcp` over the loopback
+> network. The `--allowed-host` list remains the in-process **DNS-rebinding** guard and does not
+> replace the gateway. This keeps TLS termination, certificate rotation, identity, and rate
+> limiting in the standard, auditable edge — not in the engine.
+
 ```mermaid
 flowchart LR
     AG["MCP host / agent"] -- stdio (child process) --> SRV["riga-mcp"]
