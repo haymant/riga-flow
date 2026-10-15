@@ -1,12 +1,9 @@
-//! 10k-trade book benchmark: cluster → representative price → scale (Phase 10 slice).
-//!
-//! Builds a 10,000-trade book, groups it with the scheduler's composition planner,
-//! prices one representative per cluster through the engine, and reports the
-//! wall-clock/trades-per-second. Run:
+//! 10k-trade book benchmark through the Phase-7 dispatcher (clusters × scenarios ×
+//! path blocks, CRN + scenario-cache reuse). Run:
 //! `cargo run --release -p riga-engine --example book_bench`.
 
+use riga_engine::dispatch::dispatch;
 use riga_engine::fixture::load_termsheet1_fixture;
-use riga_engine::price_put_leg;
 use riga_scheduler::{
     ClusterPlanner, ExecutionCompositionKey, KnockInType, KnockOutType, ObservationMode,
     ObservationTopology, ProductFamily, SettlementMethod, SettlementStyle, TradeDescriptor,
@@ -14,17 +11,24 @@ use riga_scheduler::{
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// 50 distinct composition keys: family(2) × cardinality(5) × coupon mode(5).
+const COMPOSITIONS: usize = 50;
+
 fn composition(i: usize) -> ExecutionCompositionKey {
+    let families = [ProductFamily::Phoenix, ProductFamily::Autocallable];
+    let cardinalities = [1usize, 2, 3, 5, 10];
+    let coupons = [
+        ObservationMode::Daily,
+        ObservationMode::Weekly,
+        ObservationMode::Monthly,
+        ObservationMode::Continuous,
+        ObservationMode::FinalFixing,
+    ];
     ExecutionCompositionKey {
-        family: [ProductFamily::Phoenix, ProductFamily::Autocallable][i % 2].clone(),
-        basket_cardinality: [1usize, 2, 3, 5][i % 4],
+        family: families[(i / 25) % 2].clone(),
+        basket_cardinality: cardinalities[(i / 5) % 5],
         observation_topology: ObservationTopology {
-            coupon: [
-                ObservationMode::Daily,
-                ObservationMode::Weekly,
-                ObservationMode::Monthly,
-            ][i % 3]
-                .clone(),
+            coupon: coupons[i % 5].clone(),
             knock_out: ObservationMode::Daily,
             knock_in: ObservationMode::FinalFixing,
         },
@@ -40,10 +44,10 @@ fn composition(i: usize) -> ExecutionCompositionKey {
 
 fn main() {
     const TRADES: usize = 10_000;
-    const COMPOSITIONS: usize = 24;
 
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/fixture/termsheet1.json");
     let request = load_termsheet1_fixture(path).unwrap().request;
+    let config = request.config.clone();
 
     let trades: Vec<TradeDescriptor<usize>> = (0..TRADES)
         .map(|i| TradeDescriptor {
@@ -55,22 +59,21 @@ fn main() {
         .collect();
 
     let plan = ClusterPlanner.plan(trades).unwrap();
-    let clusters = plan.clusters.len();
-
     let start = Instant::now();
-    let mut book_pv = 0.0;
-    let mut priced = 0usize;
-    for cluster in &plan.clusters {
-        // One representative valuation per cluster (composition-compatible trades share a kernel).
-        let result = price_put_leg(&request).unwrap();
-        book_pv += result.pv * cluster.trades.len() as f64;
-        priced += 1;
-    }
+    let report = dispatch(&plan, &request, &config).unwrap();
     let elapsed = start.elapsed().as_secs_f64();
 
     println!(
-        "10k book: {TRADES} trades, {clusters} clusters, {priced} representative valuations, \
-         {elapsed:.3} s -> {:.0} trades/s (scaled book PV {book_pv:.4e})",
-        TRADES as f64 / elapsed
+        "10k book: {} trades, {} clusters (target {COMPOSITIONS}), {} scenarios, \
+         {} path blocks -> {} evaluations, {} cache hits, {elapsed:.3} s ({:.0} trades/s), \
+         scaled book PV {:.6e}",
+        report.trades,
+        report.clusters,
+        report.scenarios,
+        report.path_blocks,
+        report.evaluations,
+        report.cache_hits,
+        report.trades as f64 / elapsed,
+        report.book_pv,
     );
 }

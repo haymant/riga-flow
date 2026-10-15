@@ -8,6 +8,7 @@ use riga_core::{
 use riga_market::ImpliedVolGrid;
 use serde::{Deserialize, Serialize};
 
+pub mod dispatch;
 pub mod explain;
 pub mod fixture;
 pub mod gpu;
