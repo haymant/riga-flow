@@ -25,8 +25,15 @@ Start at [`docs/README.md`](docs/README.md). The tree is organised as:
 
 ## Status
 
-Early design. See [`docs/plan/20-roadmap.md`](docs/plan/20-roadmap.md) and
-[`docs/plan/24-gaps-and-risks.md`](docs/plan/24-gaps-and-risks.md). The first end-to-end
-fixture is a real worst-of *Memory US Stocks ELI* (`termsheet1`), whose down-and-in PUT leg
-is pinned at **≈ 0.02112** — see
-[`docs/plan/23-testing-validation.md`](docs/plan/23-testing-validation.md).
+The branch includes a **CPU full-Phoenix GBM proxy** (daily global KO, coupon accrual/memory,
+final-fixing EKI, redemption and discounted leg attribution), a deterministic graph runtime,
+FD/CRN Greeks, composition clustering/scheduling metadata, and thin MCP stdio/Streamable HTTP
+adapters. The canonical `termsheet1` source fixture is loaded with its trade terms and market
+inputs, but its own provenance marks key curves/surface/coupon/payment fields as reference
+placeholders and supplies no current as-of spots (the proxy starts from the initial fixings).
+Therefore the issuer PUT threshold is **blocked pending market capture**, not
+reported as passed; the executed flat-ATM GBM proxy result is recorded in the phase evidence.
+Calibrated Dupire LV, tensorized 100k-trade execution, SIMD/GPU, full MCP long-run features, and
+the user-deferred `fina-builder` handoff remain outside the completed gates. See the
+[phase-by-phase evidence report](docs/plan/25-implementation-evidence.md) for per-phase exit
+criteria, evidence and blockers, and the roadmap in [`docs/plan/20-roadmap.md`](docs/plan/20-roadmap.md).

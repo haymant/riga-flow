@@ -1,0 +1,14 @@
+[package]
+name = "riga-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "riga"
+path = "src/main.rs"
+
+[dependencies]
+riga-core = { path = "../riga-core" }
+riga-engine = { path = "../riga-engine" }
+serde_json.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "riga-risk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+riga-core = { path = "../riga-core" }
+riga-engine = { path = "../riga-engine" }

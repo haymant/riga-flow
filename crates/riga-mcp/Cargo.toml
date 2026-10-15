@@ -1,0 +1,22 @@
+[package]
+name = "riga-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Thin MCP adapter for riga-flow pricing"
+
+[dependencies]
+axum = "0.8"
+riga-core = { path = "../riga-core" }
+riga-engine = { path = "../riga-engine" }
+rmcp = { version = "3.5.1", features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }

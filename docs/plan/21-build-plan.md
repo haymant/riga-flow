@@ -1,6 +1,7 @@
 # 21 — Build Plan
 
-> **Status:** Planning. Each phase has deliverables and exit criteria.
+> **Status:** Planning. Each phase has deliverables and exit criteria. Current implementation
+> evidence and unmet gates are tracked in [`25-implementation-evidence.md`](25-implementation-evidence.md).
 
 ---
 
