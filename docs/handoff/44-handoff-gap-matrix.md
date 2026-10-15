@@ -132,6 +132,18 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
   which is the expected outcome for a discontinuous, high-dimensional barrier payoff — the
   mechanism is present and selectable, the payoff just does not reward QMC much.
 
+**fina-builder build (now required scope):**
+
+The downstream build prompt is [`45-fina-builder-build-handoff-prompt.md`](45-fina-builder-build-handoff-prompt.md).
+It adds the payoff Petri net + transition/token detail panels, schema-driven trade/market controls,
+an evidence→tile map, a lineage/explainability dashboard template + notebook, reactive re-eval, a
+title-bar trace-level selector, and the riga-flow MCP linkage (stdio + HTTP). Three **optional**
+engine deltas are tracked there (§13) and are **not** blockers:
+
+- **R-EXT-2** `query_place_tokens` — first-class per-place token listing (today: sampled via `execution_events` + `query_path_cube`).
+- **R-EXT-1** N-factor + FX market model — makes FX/FX-vol live (today: presentational; riga-flow is 2-factor equity).
+- **R-EXT-3** per-place risk concentration for the risk net (today: per-transition + per-asset).
+
 **Out of scope (user decision):**
 
 - Independent **QuantLib / 1 bp reference comparison** — removed from scope. riga-flow validates

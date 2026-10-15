@@ -1,7 +1,8 @@
 # 40 — Handoff to `fina-builder` (Visual Atlas)
 
-> **Status:** Planning. This is a **handoff specification**, not part of the
-> riga-flow engine scope.
+> **Status:** **Required scope** (no longer deferred). This is a **handoff specification**; the
+> engine-side work is complete and the executable build prompt for `fina-builder` is
+> [`45-fina-builder-build-handoff-prompt.md`](45-fina-builder-build-handoff-prompt.md).
 
 ---
 

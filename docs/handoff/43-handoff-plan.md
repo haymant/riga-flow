@@ -1,6 +1,7 @@
 # 43 — Handoff Plan & Checklist
 
-> **Status:** Planning. Executed **after riga-flow is ready** (Milestone M6).
+> **Status:** **Required scope** — the riga-flow prerequisites (§1) are met. Executable build
+> prompt: [`45-fina-builder-build-handoff-prompt.md`](45-fina-builder-build-handoff-prompt.md).
 
 ---
 
