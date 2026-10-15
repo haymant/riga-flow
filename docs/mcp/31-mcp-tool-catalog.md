@@ -17,7 +17,7 @@ risk (`compute_risk`, `risk_batch`, `compute_book_risk`, `price_book`, `pl_expla
 `get_ledger`, `query_execution_net`, `query_risk_net`, `query_pathcube` + `query_path_cube`,
 `validate_greeks`, `recommend_scenarios`, `scenario`, `root_cause`, `export_governance_evidence`)
 and regression (`freeze_baseline`, `compare_corpus`, `triage_regression`). It also serves the
-**resources** (§6) and **prompts** (§7) surfaces — 34 tools in total. Task/progress/cancellation and remote
+**resources** (§6) and **prompts** (§7) surfaces — 35 tools in total. Task/progress/cancellation and remote
 (HTTP) parity testing remain — see the handoff gap matrix,
 [`../handoff/44-handoff-gap-matrix.md`](../handoff/44-handoff-gap-matrix.md), and
 [`../plan/25-implementation-evidence.md`](../plan/25-implementation-evidence.md).

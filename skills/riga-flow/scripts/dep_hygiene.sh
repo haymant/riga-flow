@@ -31,7 +31,7 @@ check riga-engine    riga-core riga-market rand rand_chacha rand_distr serde ser
 check riga-risk      riga-core riga-engine
 check riga-scheduler serde
 check riga-cli       riga-core riga-engine serde_json
-check riga-mcp       axum riga-core riga-engine riga-risk rmcp schemars serde serde_json tokio
+check riga-mcp       axum riga-core riga-engine riga-risk rmcp schemars serde serde_json sha2 tokio
 
 # no-ui: riga-flow ships no frontend assets.
 if find crates -type f \( -name '*.html' -o -name '*.css' -o -name '*.tsx' -o -name '*.jsx' \) | grep -q .; then

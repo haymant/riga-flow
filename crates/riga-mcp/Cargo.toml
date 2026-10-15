@@ -13,6 +13,7 @@ axum = "0.8"
 riga-core = { path = "../riga-core" }
 riga-engine = { path = "../riga-engine" }
 riga-risk = { path = "../riga-risk" }
+sha2.workspace = true
 rmcp = { version = "3.5.1", features = [
     "server",
     "macros",

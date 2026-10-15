@@ -104,7 +104,7 @@ criterion remains open. A row marked “slice passed” does not certify a broad
 | --- | --- | --- | --- |
 | 0 — Foundations & determinism | Explicit inputs, reproducibility, validation, CI | **Partial** | Pinned toolchain, content-addressed snapshot identity, stable seed, validation, local `make check` pass. Remote CI and complete production determinism envelope are not evidenced. |
 | 1 — Core types & tensor layout | Checked layouts, correctness, trace-off and measured behavior | **Partial** | Two layouts, serde, bounds tests, allocation-free trace-off helper and 1.80× factor-major benchmark. Trace-off is not yet wired through the production pricing hot loop. |
-| 2 — GBM + reference validation | Model and independent reference acceptance | **Partial** | CPU GBM/LV and pinned PUT/KI fixture gate pass; correlation **Cholesky** + PathCube generation; **QMC (digit-scrambled Halton + Brownian bridge)** wired — marginal variance reduction at the full path dimension (Sobol + Owen scrambling remain). Independent QuantLib/1 bp comparison remains. |
+| 2 — GBM + reference validation | Model and independent reference acceptance | **Partial** | CPU GBM/LV and pinned PUT/KI fixture gate pass; correlation **Cholesky** + PathCube generation; **QMC (digit-scrambled Halton + Brownian bridge)** wired — marginal variance reduction at the full path dimension (Sobol + Owen scrambling remain). Independent QuantLib/1 bp reference is **out of scope** (user decision). |
 | 3 — Graph execution runtime | Petri runtime drives the payoff and reproduces all legs | **Partial** | Runtime/payoff graph, typed shape/input guards, and randomized parity for the tested PUT/coupon slice. The production full-note kernel does not run through the graph; graph stats are not a full event-statistics implementation. |
 | 4 — Scan primitives | Correct scans and memory coupon lowered through them | **Partial** | Inclusive, segmented and masked scans pass randomized reference tests; graph memory carry uses segmented scan. Full schedule/lifecycle graph integration and scale/performance proof remain. |
 | 5 — FD Greeks + CRN | Correct scenarios, CRN, convergence and error evidence | **Partial** | Surface-aware Delta/Gamma/Vega, rate and correlation scenarios; 140.18× variance-reduction experiment. Paired path-covariance Greek errors and convergence/stability study remain. |
@@ -114,7 +114,7 @@ criterion remains open. A row marked “slice passed” does not certify a broad
 | 9 — GPU path propagation | GPU propagation, throughput and loud-unavailable behavior | **Partial / hardware blocked here** | Optional CUDA worst-of kernel and a conservative per-host Make selector; this sandbox has no GPU, so runtime parity/throughput was not rerun. GPU LV propagation, coupon kernels and end-to-end GPU pricing remain. |
 | 10 — Production risk engine | 61-scenario factors, aggregation and 100k-book performance | **Partial** | 13-scenario/two-asset CRN report, DV01, correlation sensitivity, PnL explain and aggregation. Full 61-scenario lane and 100k-book timing remain. |
 | 11 — Explainability & ledger | Attribution, replay, snapshots and archive | **Partial** | Leg/ledger output, event-consistent pricing statistics, deterministic replay/path reconstruction and percentile query. Persistent PathCube/run archive and full evidence lineage remain. |
-| 12 — MCP server | Catalog, transports, errors, progress/cancellation | **Partial** | Full handoff **tool** surface (34 tools) + **9 resources** + **6 prompts** + **tasks lifecycle** (`tasks/get|update|cancel`) over stdio and optional HTTP, structured errors, PathCube naming alias, `health` git SHA, frozen tool-name/schema test, and a **stdio↔HTTP parity** check. `build_cashflows` carries a per-period timeline, `execution_events` an event tape, and `root_cause` a change log — see [`../handoff/44-handoff-gap-matrix.md`](../handoff/44-handoff-gap-matrix.md). |
+| 12 — MCP server | Catalog, transports, errors, progress/cancellation | **Partial** | Full handoff **tool** surface (35 tools) + **9 resources** + **6 prompts** + **client-driven Tasks** (`price_book_async` → SEP-2663 task with progress/cancellation; `tasks/get|update|cancel`) over stdio and optional HTTP, structured errors, PathCube naming alias, `health` git SHA, and a frozen **SHA-256 tool-schema snapshot** + **stdio↔HTTP parity** check. `build_cashflows` carries a per-period timeline, `execution_events` an event tape, and `root_cause` a change log — see [`../handoff/44-handoff-gap-matrix.md`](../handoff/44-handoff-gap-matrix.md). |
 | 13 — `fina-builder` handoff | Frozen contract and downstream visual atlas | **Deferred by user request** | Intentionally excluded; no handoff integration performed. |
 
 ## Remaining gates
@@ -123,8 +123,8 @@ criterion remains open. A row marked “slice passed” does not certify a broad
    legs with consistent units and event populations.
 2. Wire `TraceLevel::Off` through the production hot loop; implement meaningful graph transition
    statistics rather than treating shape retention as event probability.
-3. Add independent CPU/QuantLib reference checks, paired-CRN covariance errors, convergence and
-   scenario stability evidence; expand risk to the complete 61-factor set.
+3. Add paired-CRN covariance errors, convergence evidence, and expand risk to the complete
+   61-factor set.
 4. Connect scheduler/cache to actual engine batches and measure 100k-book time/memory.
 5. Add wider SIMD and meet or explicitly revise the 3–10× performance target.
 6. Extend CUDA to local-vol propagation and coupon/full-note pricing. A device-equipped runner is

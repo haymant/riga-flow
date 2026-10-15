@@ -104,27 +104,33 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
 | Regression report | `compare_corpus` / `triage_regression` | ✅ |
 | Scenario comparison | `scenario` / `compute_risk` | ✅ |
 
-## 8. Remaining open gates (engine side)
+## 8. Status (engine side)
 
-1. **Sobol / QMC variance reduction** — implemented as a **digit-scrambled Halton** ladder with a
-   **Brownian bridge** (`riga_engine::qmc`, `VarianceReduction::Halton`, inverse-CDF normals,
-   CRN-shared, no cube materialised; `PathIdentity.sobol_index` populated). Evidence: **1.05×**
-   variance reduction at the full ~210-dim path and **0.75×** at low dimension — marginal, because
-   the payoff is discontinuous and high-dimensional. Meaningful gains need **Sobol
-   direction-number tables + Owen scrambling** (research-level), not just the bridge.
-2. Versioned **JSON-Schema hash** snapshot (tool names + schemas are now frozen structurally by a
-   CI test; a cryptographic hash snapshot remains).
+**Closed since handoff review:**
 
-Resolved in the last pass:
+- **MCP tool/resource/prompt surface** — 35 tools + 9 resources + 6 prompts.
+- **Tool deepening** — `build_cashflows` per-period coupon timeline; `execution_events` per-path
+  event tape; `root_cause` change log against a frozen baseline.
+- **Client-driven Tasks + progress** — `price_book_async` materialises a SEP-2663 task
+  (`CallToolResponse::Task`) when the client declares tasks support; the task body reports
+  progress (`TaskContext::set_status_message`) and honours cancellation
+  (`is_cancel_requested`); `tasks/get|update|cancel` implemented.
+- **stdio ↔ HTTP parity** — `skills/riga-flow/scripts/check_mcp_parity.py` (PASS).
+- **Frozen JSON-Schema snapshot** — the exact tool catalogue (name + description + input schema)
+  is pinned by **SHA-256** in a CI test (`TOOL_SCHEMA_SHA256`); changes require a deliberate bump
+  (invariant I-HC5).
 
-- **Tool deepening** — `build_cashflows` returns a **per-period coupon timeline** (expected coupon
-  PV + paid probability); `execution_events` returns a bounded **per-path event tape**
-  (KO / knock-in / maturity); `root_cause` correlates against a frozen baseline (**change log**).
-- **MCP Tasks lifecycle** — `tasks/get`, `tasks/update`, `tasks/cancel` implemented via
-  `rmcp::task_manager::TaskManager`, `.enable_tasks()` advertised (SEP-2663). Cooperative
-  progress (`TaskContext::set_status_message`) and cancellation (`is_cancel_requested`) are
-  available to task bodies; client-driven task creation follows the extension flow.
-- **stdio ↔ HTTP parity** — `skills/riga-flow/scripts/check_mcp_parity.py` runs the same
-  `price_put` over both transports and asserts identical payloads (**PASS**).
+**Remaining (engine-side):**
 
-Everything else in the handoff is served by a working `riga-mcp` tool, resource, or prompt.
+1. **Sobol + Owen scrambling** — real QMC gains. The digit-scrambled Halton + Brownian bridge
+   costs only marginal variance reduction (~1.05× at the full ~210-dim path); a discontinuous,
+   high-dimensional barrier payoff needs Sobol direction-number tables plus Owen scrambling
+   (research-level).
+
+**Out of scope (user decision):**
+
+- Independent **QuantLib / 1 bp reference comparison** — removed from scope. riga-flow validates
+  against the pinned `termsheet1` fixture and the upstream reference grid, not a QuantLib harness.
+
+Everything else in the handoff is served by a working `riga-mcp` tool, resource, prompt, or task
+method.

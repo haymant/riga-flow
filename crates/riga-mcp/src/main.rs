@@ -2,16 +2,17 @@ use riga_engine::fixture::load_termsheet1_fixture;
 use riga_engine::{PriceRequest, explain, price_put_leg};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
-    handler::server::wrapper::Parameters,
+    handler::server::{tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolResult, CancelTaskParams, GetTaskParams, GetTaskResult, Implementation,
-        ListResourcesResult, PaginatedRequestParams, PromptMessage, ReadResourceRequestParams,
-        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role,
-        ServerCapabilities, ServerConfig, UpdateTaskParams,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        CreateTaskResult, GetTaskParams, GetTaskResult, Implementation, ListResourcesResult,
+        PaginatedRequestParams, PromptMessage, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, Resource, ResourceContents, Role, ServerCapabilities, ServerConfig,
+        UpdateTaskParams,
     },
     prompt, prompt_handler, prompt_router, schemars,
     service::RequestContext,
-    task_manager::TaskManager,
+    task_manager::{TaskContext, TaskManager, TaskOptions},
     tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -428,6 +429,17 @@ impl RigaMcp {
     }
 
     #[tool(
+        description = "Async book risk (SEP-2663): when the client supports tasks this call returns a task handle with progress/cancellation; otherwise it is computed inline."
+    )]
+    fn price_book_async(&self, Parameters(p): Parameters<BookParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| book_risk_json(&fx, &p.notionals)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
         description = "P&L explain: contributions from spot/vol/rate/correlation moves via the risk batch."
     )]
     fn pl_explain(&self, Parameters(p): Parameters<PnlExplainParams>) -> CallToolResult {
@@ -827,6 +839,32 @@ impl ServerHandler for RigaMcp {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
         std::future::ready(self.tasks.cancel_task(&request.task_id))
+    }
+
+    /// Intercepts `price_book_async` to materialise a SEP-2663 task when the client supports
+    /// tasks (returning `CreateTaskResult`); every other tool call goes to the generated router.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if request.name.as_ref() == "price_book_async" {
+            let supports_tasks = context
+                .peer
+                .peer_info()
+                .map(|info| info.capabilities.supports_tasks())
+                .unwrap_or(false);
+            if supports_tasks {
+                let fixture_path = self.default_fixture_path.clone();
+                let notionals = parse_notionals(request.arguments.as_ref());
+                let task = self.tasks.spawn(TaskOptions::new(), move |ctx| {
+                    Box::pin(run_book_task(fixture_path, notionals, ctx))
+                });
+                return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
+            }
+        }
+        let tool_context = ToolCallContext::new(self, request, context);
+        Self::tool_router().call(tool_context).await
     }
 }
 
@@ -1694,9 +1732,62 @@ fn compare_corpus_json(
     }))
 }
 
+fn parse_notionals(arguments: Option<&serde_json::Map<String, Value>>) -> Vec<f64> {
+    arguments
+        .and_then(|args| args.get("notionals"))
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default()
+}
+
+/// Body of the async `price_book_async` task: prices the book with progress messages and
+/// cooperative cancellation (SEP-2663).
+async fn run_book_task(
+    fixture_path: PathBuf,
+    notionals: Vec<f64>,
+    ctx: TaskContext,
+) -> Result<CallToolResult, rmcp::task_manager::TaskExit> {
+    use rmcp::task_manager::TaskExit;
+    ctx.set_status_message("book: pricing");
+    let fixture =
+        load_fixture(&fixture_path).map_err(|e| ErrorData::internal_error(e.message, None))?;
+    let report = riga_risk::price_risk_batch(
+        &fixture.request,
+        &riga_risk::CentralDifferenceConfig::default(),
+    )
+    .map_err(|e| ErrorData::internal_error(e.message, None))?;
+    if ctx.is_cancel_requested() {
+        return Err(TaskExit::Cancelled);
+    }
+    ctx.set_status_message("book: aggregating");
+    let notionals = if notionals.is_empty() {
+        vec![1.0]
+    } else {
+        notionals
+    };
+    let rows: Vec<(f64, riga_risk::BatchRiskReport)> =
+        notionals.iter().map(|n| (*n, report.clone())).collect();
+    let portfolio = riga_risk::aggregate_portfolio(&rows);
+    ctx.set_status_message("book: done");
+    Ok(structured_success(json!({
+        "trades": portfolio.trades,
+        "pv": portfolio.pv,
+        "delta": portfolio.delta,
+        "gamma": portfolio.gamma,
+        "vega": portfolio.vega,
+        "dv01": portfolio.dv01,
+        "correlation_sensitivity": portfolio.correlation_sensitivity,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SHA-256 of the frozen tool catalogue (name + description + input schema).
+    /// Bump only for an intentional, versioned schema change.
+    const TOOL_SCHEMA_SHA256: &str =
+        "0b1f4798a89b918f1324664a96444e422df1d309a1fb4382af468e88b4561a1d";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -1729,6 +1820,7 @@ mod tests {
             "list_markets",
             "pl_explain",
             "price_book",
+            "price_book_async",
             "price_put",
             "price_trade",
             "query_execution_net",
@@ -1766,6 +1858,23 @@ mod tests {
                 .iter()
                 .all(|tool| tool.input_schema.get("type").is_some()),
             "every tool must declare an input schema"
+        );
+
+        // Versioned JSON-Schema snapshot (handoff 42 §8): the exact catalogue
+        // (name + description + input schema) is pinned by SHA-256. Any change —
+        // rename, retype, reword — must update this digest in the same commit, so
+        // the contract is frozen and only bumped deliberately (invariant I-HC5).
+        use sha2::{Digest, Sha256};
+        let canonical = RigaMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| serde_json::to_string(&tool).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let digest = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        assert_eq!(
+            digest, TOOL_SCHEMA_SHA256,
+            "tool schema catalogue changed; update TOOL_SCHEMA_SHA256 if intentional"
         );
     }
 
