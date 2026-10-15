@@ -80,7 +80,7 @@ How to read it:
 
 `riga-mcp` exposes three surfaces (see [`docs/handoff/44-handoff-gap-matrix.md`](../../docs/handoff/44-handoff-gap-matrix.md)):
 
-- **tools** — 33, covering pricing, simulation, risk, explainability and regression;
+- **tools** — 34, covering pricing, simulation, risk, explainability and regression;
 - **resources** — 9 URIs (`riga://market|run|book|ledger|net|risknet|stats|path|fixtures/…`),
   each returning the same JSON a tool returns;
 - **prompts** — 6 grounded templates (`explain_pv_change`, `investigate_validation_failure`,

@@ -148,6 +148,20 @@ struct CorpusParams {
     name: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TapeParams {
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Number of leading paths to emit events for.
+    #[serde(default = "default_tape_size")]
+    max_paths: usize,
+}
+
+fn default_tape_size() -> usize {
+    8
+}
+
 #[tool_router]
 impl RigaMcp {
     #[tool(description = "Report riga-mcp liveness, version, and enabled engine features.")]
@@ -375,6 +389,17 @@ impl RigaMcp {
         }
     }
 
+    #[tool(
+        description = "Execution event tape: a bounded per-path stream (KO / knock-in / maturity) for inspection."
+    )]
+    fn execution_events(&self, Parameters(p): Parameters<TapeParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| events_json(&fx, p.max_paths)) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
     #[tool(description = "Central-FD Greeks (CRN) for the trade (alias of risk_batch).")]
     fn compute_risk(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
         self.risk_batch(Parameters(RiskBatchParams {
@@ -506,6 +531,10 @@ impl RigaMcp {
                 "assets": report.assets.iter().map(|a| json!({"delta": a.delta, "gamma": a.gamma, "vega": a.vega})).collect::<Vec<_>>(),
                 "dv01": report.dv01(),
                 "correlation_sensitivity": report.correlation_sensitivity(),
+                "frozen_at_unix": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
             });
             baselines().lock().unwrap().insert(name.clone(), snapshot.clone());
             Ok(json!({"name": name, "frozen": snapshot}))
@@ -1352,6 +1381,25 @@ fn cashflows_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, Too
     let funding = records.iter().map(|r| r.funding).sum::<f64>() / n;
     let coupon = records.iter().map(|r| r.coupon_pv).sum::<f64>() / n;
     let put = records.iter().map(|r| r.put_payoff).sum::<f64>() / n;
+    let periods = records
+        .first()
+        .map(|r| r.coupon_by_period.len())
+        .unwrap_or(0);
+    let timeline: Vec<Value> = (0..periods)
+        .map(|p| {
+            let expected = records
+                .iter()
+                .map(|r| r.coupon_by_period.get(p).copied().unwrap_or(0.0))
+                .sum::<f64>()
+                / n;
+            let paid = records
+                .iter()
+                .filter(|r| r.coupon_by_period.get(p).copied().unwrap_or(0.0) > 0.0)
+                .count() as f64
+                / n;
+            json!({"period": p + 1, "expected_coupon_pv": expected, "paid_probability": paid})
+        })
+        .collect();
     let sample: Vec<Value> = records
         .iter()
         .take(3)
@@ -1368,8 +1416,32 @@ fn cashflows_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, Too
     Ok(json!({
         "paths": records.len(),
         "mean": {"funding": funding, "coupon_pv": coupon, "put_payoff": put},
+        "timeline": timeline,
         "sample_paths": sample,
     }))
+}
+
+fn events_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    max_paths: usize,
+) -> Result<Value, ToolError> {
+    let records = explain::run_paths(&fx.request).map_err(ToolError::from_engine)?;
+    let tape: Vec<Value> = records
+        .iter()
+        .take(max_paths.max(1))
+        .map(|r| {
+            let mut events = Vec::new();
+            if r.knocked_out {
+                events.push(json!({"kind": "ko", "t": r.ko_time}));
+            } else if r.ki_hit {
+                events.push(json!({"kind": "knock_in", "worst_final": r.worst_final}));
+            } else {
+                events.push(json!({"kind": "maturity_no_ki", "worst_final": r.worst_final}));
+            }
+            json!({"path_id": r.identity.path_id, "events": events, "pv": r.pv})
+        })
+        .collect();
+    Ok(json!({"total_paths": records.len(), "tape_size": tape.len(), "tape": tape}))
 }
 
 fn execution_net_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
@@ -1456,6 +1528,24 @@ fn recommendations_json(fx: &riga_engine::fixture::LoadedFixture) -> Value {
 
 fn rca_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
     let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
+    // Change-log correlation: compare against the frozen "default" baseline if one exists.
+    let change_log = baselines()
+        .lock()
+        .unwrap()
+        .get("default")
+        .cloned()
+        .map(|b| {
+            let base_pv = b["pv"].as_f64().unwrap_or(0.0);
+            json!({
+                "baseline_pv": base_pv,
+                "current_pv": result.pv,
+                "delta_pv": result.pv - base_pv,
+                "frozen_at_unix": b["frozen_at_unix"],
+                "dominant_transitions": result.ledger.iter().map(|e| json!({
+                    "transition_id": e.transition_id, "pv_impact": e.pv_impact,
+                })).collect::<Vec<_>>(),
+            })
+        });
     Ok(json!({
         "trade": fx.request.trade.trade_id,
         "market_snapshot_id": result.determinism.market_snapshot_id,
@@ -1465,7 +1555,8 @@ fn rca_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError
             result.legs.down_and_in_put, result.ki_probability
         ),
         "evidence_refs": result.ledger.iter().flat_map(|e| e.evidence_refs.clone()).collect::<Vec<_>>(),
-        "note": "RCA is grounded in the ledger + determinism envelope; change-log correlation needs a persisted run history.",
+        "change_log": change_log,
+        "note": "RCA is grounded in the ledger + determinism envelope; freeze_baseline first to correlate against a prior run.",
     }))
 }
 
@@ -1623,6 +1714,7 @@ mod tests {
             "compute_book_risk",
             "compute_risk",
             "estimate_aad_greeks",
+            "execution_events",
             "explain_pv_attribution",
             "export_governance_evidence",
             "freeze_baseline",

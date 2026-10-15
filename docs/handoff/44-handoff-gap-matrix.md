@@ -112,14 +112,14 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
    variance reduction at the full ~210-dim path and **0.75×** at low dimension — marginal, because
    the payoff is discontinuous and high-dimensional. Meaningful gains need **Sobol
    direction-number tables + Owen scrambling** (research-level), not just the bridge.
-2. Deepen a few tools: `build_cashflows` per-period timeline (currently per-path aggregate);
-   `execution_events` streaming event tape (currently the net snapshot); `root_cause` change-log
-   correlation (needs a persisted run history). `valuation_explain` base-vs-current is done.
-3. Versioned **JSON-Schema hash** snapshot (tool names + schemas are now frozen structurally by a
+2. Versioned **JSON-Schema hash** snapshot (tool names + schemas are now frozen structurally by a
    CI test; a cryptographic hash snapshot remains).
 
 Resolved in the last pass:
 
+- **Tool deepening** — `build_cashflows` returns a **per-period coupon timeline** (expected coupon
+  PV + paid probability); `execution_events` returns a bounded **per-path event tape**
+  (KO / knock-in / maturity); `root_cause` correlates against a frozen baseline (**change log**).
 - **MCP Tasks lifecycle** — `tasks/get`, `tasks/update`, `tasks/cancel` implemented via
   `rmcp::task_manager::TaskManager`, `.enable_tasks()` advertised (SEP-2663). Cooperative
   progress (`TaskContext::set_status_message`) and cancellation (`is_cancel_requested`) are

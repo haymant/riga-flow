@@ -38,6 +38,9 @@ pub struct PathRecord {
     pub ki_hit: bool,
     pub put_payoff: f64,
     pub coupon_pv: f64,
+    /// Expected coupon PV per remaining period (index = period), for the timeline view.
+    #[serde(default)]
+    pub coupon_by_period: Vec<f64>,
     pub funding: f64,
     pub pv: f64,
 }
@@ -120,6 +123,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
             let mut accrual_this_period = 0.0;
             let mut unpaid_memory = 0.0;
             let mut path_coupon_pv = 0.0;
+            let mut coupon_by_period = vec![0.0; periods];
             let mut path_memory_coupon_pv = 0.0;
             let mut path_received_coupon = false;
             let mut final_worst = 1.0;
@@ -186,6 +190,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                         let df = (-rate * time).exp();
                         path_coupon_pv += due * df;
                         path_memory_coupon_pv += carry_paid * df;
+                        coupon_by_period[period] += coupon_amount * df;
                         path_received_coupon = true;
                     }
                     continue;
@@ -207,6 +212,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                         let df = (-rate * time).exp();
                         path_coupon_pv += due * df;
                         path_memory_coupon_pv += unpaid_memory * df;
+                        coupon_by_period[period] += (due + unpaid_memory) * df;
                         path_received_coupon = true;
                         unpaid_memory = 0.0;
                     } else if request.trade.memory_coupon {
@@ -243,6 +249,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                 ki_hit: hit_ki,
                 put_payoff: put,
                 coupon_pv: coupon_nominal,
+                coupon_by_period,
                 funding,
                 pv,
             });
