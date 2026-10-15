@@ -550,6 +550,19 @@ impl RigaMcp {
     }
 
     #[tool(
+        description = "Base-vs-current valuation explain: reprice under spot/vol/rate/correlation moves and decompose the PV change (Taylor) with a residual."
+    )]
+    fn valuation_explain(&self, Parameters(p): Parameters<PnlExplainParams>) -> CallToolResult {
+        let path = self.resolve(&p.fixture_path);
+        match load_fixture(&path).and_then(|fx| {
+            valuation_explain_json(&fx, &p.spot_moves, &p.vol_moves, p.rate_move, p.corr_move)
+        }) {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
         description = "Bump scenarios (base + central up/down per factor) for scenario comparison; fills the atlas Scenario Comparison view."
     )]
     fn scenario(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
@@ -1189,6 +1202,53 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+fn valuation_explain_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    spot_moves: &[f64],
+    vol_moves: &[f64],
+    rate_move: f64,
+    corr_move: f64,
+) -> Result<Value, ToolError> {
+    let base = fx.request.clone();
+    let base_pv = price_put_leg(&base).map_err(ToolError::from_engine)?.pv;
+    let mut current = base.clone();
+    for (i, ds) in spot_moves.iter().enumerate() {
+        if let Some(spot) = current.market.spots.get_mut(i) {
+            *spot += ds;
+        }
+    }
+    for (i, dv) in vol_moves.iter().enumerate() {
+        if let Some(vol) = current.market.vols.get_mut(i) {
+            *vol = (*vol + dv).max(0.0);
+        }
+    }
+    current.market.risk_free_rate += rate_move;
+    if let Some(row) = current.market.correlation.get_mut(0)
+        && let Some(entry) = row.get_mut(1)
+    {
+        *entry += corr_move;
+    }
+    if let Some(row) = current.market.correlation.get_mut(1)
+        && let Some(entry) = row.get_mut(0)
+    {
+        *entry += corr_move;
+    }
+    let current_pv = price_put_leg(&current).map_err(ToolError::from_engine)?.pv;
+
+    let report = riga_risk::price_risk_batch(&base, &riga_risk::CentralDifferenceConfig::default())
+        .map_err(ToolError::from_engine)?;
+    let moves = riga_risk::pnl_explain(&report, spot_moves, vol_moves, rate_move, corr_move);
+    let predicted: f64 = moves.iter().map(|m| m.contribution).sum();
+    Ok(json!({
+        "base_pv": base_pv,
+        "current_pv": current_pv,
+        "delta_pv": current_pv - base_pv,
+        "predicted_dpv": predicted,
+        "residual": (current_pv - base_pv) - predicted,
+        "contributions": moves.iter().map(|m| json!({"factor": m.label, "contribution": m.contribution})).collect::<Vec<_>>(),
+    }))
+}
+
 fn market_json(fx: &riga_engine::fixture::LoadedFixture) -> Value {
     let m = &fx.request.market;
     json!({
@@ -1554,6 +1614,7 @@ mod tests {
             "scenario",
             "triage_regression",
             "validate_greeks",
+            "valuation_explain",
         ]
         .iter()
         .map(|s| s.to_string())

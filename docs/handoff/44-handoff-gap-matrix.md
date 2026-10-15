@@ -19,7 +19,7 @@ Legend: ✅ built · 🟡 partial · ⬜ not built.
 | `compute_risk` | `compute_risk` | ✅ central FD + CRN |
 | `get_mc_diagnostics` | `get_mc_diagnostics` | ✅ PV SE + per-transition variance |
 | `build_cashflows` | `build_cashflows` | 🟡 per-path summary + samples (no per-period timeline yet) |
-| `valuation_explain` | `explain_pv_attribution` | 🟡 legs + ledger (no base-vs-current Taylor/PLVA split yet) |
+| `valuation_explain` | `explain_pv_attribution` / `valuation_explain` | ✅ base-vs-current reprice + Taylor decomposition (residual reported) |
 | `explain_ledger` | `get_ledger` | ✅ `LedgerEntry[]` + determinism |
 | `execution_events` | `query_execution_net` | 🟡 net from stats/ledger (no streaming event tape yet) |
 | `health` | `health` | ✅ version + git SHA + feature flags |
@@ -111,9 +111,9 @@ All rendering items are `fina-builder`'s. riga-flow's obligation is the **data**
    materialised; `PathIdentity.sobol_index` populated). Evidence: **1.41×** variance reduction at
    low QMC dimension, but **weak at the full path dimension (~210)** — high-dimensional path
    generation still needs Sobol direction-number tables + a Brownian bridge.
-2. Deepen a few tools: `valuation_explain` base-vs-current Taylor/PLVA split; `build_cashflows`
-   per-period timeline (currently per-path aggregate); `execution_events` streaming event tape;
-   `root_cause` change-log correlation (needs a persisted run history).
+2. Deepen a few tools: `build_cashflows` per-period timeline (currently per-path aggregate);
+   `execution_events` streaming event tape (currently the net snapshot); `root_cause` change-log
+   correlation (needs a persisted run history). `valuation_explain` base-vs-current is done.
 3. Versioned JSON-Schema snapshot of tool names/shapes (tool *names* are pinned by a CI test).
 
 Everything else in the handoff is served by a working `riga-mcp` tool, resource, or prompt.
