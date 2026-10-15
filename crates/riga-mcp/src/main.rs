@@ -1621,6 +1621,24 @@ mod tests {
         .collect();
         expected.sort();
         assert_eq!(names, expected);
+
+        // Schema structural snapshot: the tool catalogue (names + input schemas) must be
+        // stable across calls and every tool must declare an object input schema.
+        let catalogue = |_: ()| {
+            RigaMcp::tool_router()
+                .list_all()
+                .into_iter()
+                .map(|tool| serde_json::to_string(&tool).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(catalogue(()), catalogue(()));
+        assert!(
+            RigaMcp::tool_router()
+                .list_all()
+                .iter()
+                .all(|tool| tool.input_schema.get("type").is_some()),
+            "every tool must declare an input schema"
+        );
     }
 
     #[test]
