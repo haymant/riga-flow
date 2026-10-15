@@ -14,6 +14,7 @@ pub mod fixture;
 pub mod gpu;
 pub mod graph;
 pub mod note;
+pub mod note_graph;
 pub mod pathcube;
 pub mod payoff;
 pub mod qmc;
