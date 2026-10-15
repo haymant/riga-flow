@@ -331,6 +331,12 @@ impl Transition for KiAlive {
                 .collect(),
         ))
     }
+    fn fired_count(&self, _inputs: &[&PlaceValue], output: &PlaceValue) -> Option<u64> {
+        match output {
+            PlaceValue::Bool(flags) => Some(flags.iter().filter(|&&f| f).count() as u64),
+            _ => None,
+        }
+    }
 }
 
 /// Materialise the correlated per-factor performance cube `[path, time]` using the same

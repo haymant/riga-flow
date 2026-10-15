@@ -150,7 +150,9 @@ tracing is opt-in and never production.
 **Context.** 1M paths × 20 dates = 20M events; allocating per-event "would destroy
 performance".
 
-**Consequences.** `TraceLevel::{Off,Aggregated,Sampled,Full}`; `Off` allocates nothing.
+**Consequences.** `TraceLevel::{Off,Aggregated,Sampled,Full}`; `Off` allocates nothing. Aggregated
+`TransitionStats` carry the **firing population** — `Transition::fired_count` (KO events, KI hits,
+live-and-unpaid paths, paid puts), not the output shape length.
 
 ---
 
@@ -172,7 +174,8 @@ usually the wrong clustering key".
 
 **Context (Gap #4).** "Path 82137 can always be reconstructed."
 
-**Consequences.** Enables interactive PathCube Q&A and RCA without recomputing the book.
+**Consequences.** Enables interactive PathCube Q&A and RCA without recomputing the book; a reloaded
+archive answers `PathCube::terminal_worst` / `worst_percentile_threshold` queries directly.
 
 ---
 

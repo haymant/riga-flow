@@ -172,6 +172,12 @@ impl Transition for GlobalKo {
         }
         Ok(PlaceValue::U64(out))
     }
+    fn fired_count(&self, _inputs: &[&PlaceValue], output: &PlaceValue) -> Option<u64> {
+        match output {
+            PlaceValue::U64(ko) => Some(ko.iter().filter(|&&k| k != u64::MAX).count() as u64),
+            _ => None,
+        }
+    }
 }
 
 /// `knock_in_gate` (EKI): final-fixing `worst <= knock_in_barrier`, per path.
@@ -200,6 +206,12 @@ impl Transition for KnockIn {
                 .map(|p| worst[p * times + (times - 1)] <= self.spec.knock_in_barrier)
                 .collect(),
         ))
+    }
+    fn fired_count(&self, _inputs: &[&PlaceValue], output: &PlaceValue) -> Option<u64> {
+        match output {
+            PlaceValue::Bool(flags) => Some(flags.iter().filter(|&&f| f).count() as u64),
+            _ => None,
+        }
     }
 }
 
@@ -240,6 +252,12 @@ impl Transition for DownAndInPut {
                 })
                 .collect(),
         ))
+    }
+    fn fired_count(&self, _inputs: &[&PlaceValue], output: &PlaceValue) -> Option<u64> {
+        match output {
+            PlaceValue::F64(payoffs) => Some(payoffs.iter().filter(|&&p| p > 0.0).count() as u64),
+            _ => None,
+        }
     }
 }
 
@@ -471,6 +489,25 @@ mod tests {
         assert_eq!(report.stats.len(), 8);
         assert!(report.places.contains_key("ko_period"));
         assert!(report.places.contains_key("coupon_pv_mean"));
+
+        // Event statistics report the *firing* population, not shape retention: the KO gate's
+        // output_count must equal the number of paths that actually knocked out.
+        let ko = match &report.places["ko_period"] {
+            PlaceValue::U64(values) => values,
+            other => panic!("expected U64 ko_period, got {other:?}"),
+        };
+        let fired = ko.iter().filter(|&&k| k != u64::MAX).count() as u64;
+        let stat = report
+            .stats
+            .iter()
+            .find(|s| s.transition_id == "global_ko_gate")
+            .unwrap();
+        assert_eq!(stat.output_count, fired);
+        assert!((stat.probability - fired as f64 / stat.input_count as f64).abs() < 1e-12);
+        assert!(
+            stat.probability < 1.0,
+            "KO firing must not equal shape retention"
+        );
     }
 
     fn imperative_memory_coupon(mask: &[bool], ko: u64, spec: &PayoffSpec) -> f64 {

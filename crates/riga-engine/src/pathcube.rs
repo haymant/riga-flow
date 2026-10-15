@@ -96,6 +96,27 @@ impl PathCube {
         let bytes = std::fs::read(path)?;
         serde_json::from_slice(&bytes).map_err(std::io::Error::other)
     }
+
+    /// Terminal worst-of performance `min_f S_T(f) / initial(f)` per path.
+    pub fn terminal_worst(&self, initial_spots: &[f32]) -> Vec<f32> {
+        (0..self.paths)
+            .map(|path| {
+                (0..self.factors)
+                    .map(|factor| self.get(path, self.times - 1, factor) / initial_spots[factor])
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .collect()
+    }
+
+    /// Query a persisted cube: the terminal worst-of performance threshold at `percentile`.
+    pub fn worst_percentile_threshold(&self, initial_spots: &[f32], percentile: f64) -> f32 {
+        let mut worst = self.terminal_worst(initial_spots);
+        worst.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let index = (((worst.len() as f64) * percentile).ceil() as usize)
+            .saturating_sub(1)
+            .min(worst.len() - 1);
+        worst[index]
+    }
     #[inline]
     pub fn index(&self, path: usize, time: usize, factor: usize) -> usize {
         (path * self.times + time) * self.factors + factor
@@ -261,6 +282,11 @@ mod tests {
         cube.write_archive(&path).unwrap();
         let restored = PathCube::read_archive(&path).unwrap();
         assert_eq!(cube, restored);
+        // Archive query: the worst-5% terminal threshold is finite and consistent.
+        let initial = [100.0f32, 50.0];
+        let threshold = restored.worst_percentile_threshold(&initial, 0.05);
+        assert!(threshold.is_finite() && threshold > 0.0);
+        assert!(threshold <= restored.worst_percentile_threshold(&initial, 0.5));
         let _ = std::fs::remove_file(&path);
     }
 }

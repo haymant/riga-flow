@@ -276,6 +276,56 @@ extern "C" __global__ void lv_propagate(
             Ok((terminal, ko))
         }
 
+        /// Upload the LV paths' heavy, scenario-independent buffers (normals, local-vol rows,
+        /// log-strike axes) once and keep them resident, so a multi-scenario sensitivity sweep
+        /// can re-run the propagation for many spot bumps without re-transferring them.
+        #[allow(clippy::too_many_arguments)]
+        pub fn resident_lv(
+            &self,
+            normals: &[f32],
+            rows: &[f32],
+            ls_axis: &[f32],
+            paths: usize,
+            steps: usize,
+            dt: f32,
+        ) -> Result<ResidentLv, RigaError> {
+            let gx = ls_axis.len() / 2;
+            let func = self
+                .module
+                .load_function("lv_propagate")
+                .map_err(|e| gpu_err("load lv kernel", e))?;
+            let stream = self.ctx.default_stream();
+            let normals_dev = stream
+                .clone_htod(normals)
+                .map_err(|e| gpu_err("H2D normals", e))?;
+            let rows_dev = stream
+                .clone_htod(rows)
+                .map_err(|e| gpu_err("H2D rows", e))?;
+            let ls_dev = stream
+                .clone_htod(ls_axis)
+                .map_err(|e| gpu_err("H2D ls", e))?;
+            Ok(ResidentLv {
+                ctx: self.ctx.clone(),
+                func,
+                normals: normals_dev,
+                rows: rows_dev,
+                ls: ls_dev,
+                s0: stream
+                    .alloc_zeros::<f32>(2)
+                    .map_err(|e| gpu_err("alloc s0", e))?,
+                out: stream
+                    .alloc_zeros::<f32>(paths * 2)
+                    .map_err(|e| gpu_err("alloc out", e))?,
+                ko_out: stream
+                    .alloc_zeros::<i32>(paths)
+                    .map_err(|e| gpu_err("alloc ko", e))?,
+                paths: paths as i32,
+                steps: steps as i32,
+                gx: gx as i32,
+                dt,
+            })
+        }
+
         /// Upload the two performance slices once and keep them resident on the
         /// device, so a caller can run the kernel repeatedly without re-transferring.
         pub fn resident_worst_of(
@@ -354,6 +404,89 @@ extern "C" __global__ void lv_propagate(
         }
     }
 
+    /// A resident LV propagation: the scenario-independent buffers (normals, local-vol rows,
+    /// log-strike axes) live on the device, and each `run` only ships the tiny scenario vectors.
+    pub struct ResidentLv {
+        ctx: Arc<CudaContext>,
+        func: cudarc::driver::CudaFunction,
+        normals: cudarc::driver::CudaSlice<f32>,
+        rows: cudarc::driver::CudaSlice<f32>,
+        ls: cudarc::driver::CudaSlice<f32>,
+        s0: cudarc::driver::CudaSlice<f32>,
+        out: cudarc::driver::CudaSlice<f32>,
+        ko_out: cudarc::driver::CudaSlice<i32>,
+        paths: i32,
+        steps: i32,
+        gx: i32,
+        dt: f32,
+    }
+
+    impl ResidentLv {
+        /// Run one scenario (spot bumps / rate / dividends / call barrier) over the resident
+        /// buffers. `s0` and `references` are the two initial spot levels; reusable across runs.
+        pub fn run(
+            &mut self,
+            s0: &[f32],
+            references: [f32; 2],
+            call_barrier: f32,
+            rate: f32,
+            dividends: [f32; 2],
+        ) -> Result<(), RigaError> {
+            let stream = self.ctx.default_stream();
+            stream
+                .memcpy_htod(s0, &mut self.s0)
+                .map_err(|e| gpu_err("H2D s0", e))?;
+            let cfg = LaunchConfig::for_num_elems(self.paths as u32);
+            let (ref0, ref1) = (references[0], references[1]);
+            let (q0, q1) = (dividends[0], dividends[1]);
+            let (paths, steps, gx) = (self.paths, self.steps, self.gx);
+            let dt = self.dt;
+            unsafe {
+                stream
+                    .launch_builder(&self.func)
+                    .arg(&self.normals)
+                    .arg(&self.rows)
+                    .arg(&self.ls)
+                    .arg(&self.s0)
+                    .arg(&mut self.out)
+                    .arg(&mut self.ko_out)
+                    .arg(&ref0)
+                    .arg(&ref1)
+                    .arg(&call_barrier)
+                    .arg(&paths)
+                    .arg(&steps)
+                    .arg(&gx)
+                    .arg(&dt)
+                    .arg(&rate)
+                    .arg(&q0)
+                    .arg(&q1)
+                    .launch(cfg)
+                    .map_err(|e| gpu_err("lv launch", e))?;
+            }
+            Ok(())
+        }
+
+        /// Download the most recent scenario's terminal spots and KO periods.
+        pub fn download(&self) -> Result<(Vec<f32>, Vec<i32>), RigaError> {
+            let stream = self.ctx.default_stream();
+            let terminal = stream
+                .clone_dtoh(&self.out)
+                .map_err(|e| gpu_err("D2H out", e))?;
+            let ko = stream
+                .clone_dtoh(&self.ko_out)
+                .map_err(|e| gpu_err("D2H ko", e))?;
+            Ok((terminal, ko))
+        }
+
+        /// Block until all enqueued work on the device stream has completed.
+        pub fn synchronize(&self) -> Result<(), RigaError> {
+            self.ctx
+                .default_stream()
+                .synchronize()
+                .map_err(|e| gpu_err("synchronize", e))
+        }
+    }
+
     static DEVICE: OnceLock<Result<Gpu, String>> = OnceLock::new();
 
     fn device() -> Result<&'static Gpu, RigaError> {
@@ -386,6 +519,18 @@ extern "C" __global__ void lv_propagate(
     /// Upload two performance slices and keep them resident on the device.
     pub fn resident_worst_of(a: &[f32], b: &[f32]) -> Result<ResidentWorstOf, RigaError> {
         device()?.resident_worst_of(a, b)
+    }
+
+    /// Upload the scenario-independent LV buffers and keep them resident for a spot-bump sweep.
+    pub fn resident_lv(
+        normals: &[f32],
+        rows: &[f32],
+        ls_axis: &[f32],
+        paths: usize,
+        steps: usize,
+        dt: f32,
+    ) -> Result<ResidentLv, RigaError> {
+        device()?.resident_lv(normals, rows, ls_axis, paths, steps, dt)
     }
 
     /// Propagate paths under a state-dependent local vol on the GPU; terminal spots `[path, 2]`.
@@ -421,8 +566,8 @@ extern "C" __global__ void lv_propagate(
 
 #[cfg(feature = "gpu")]
 pub use imp::{
-    ResidentWorstOf, arch, device_name, ensure_available, lv_terminal_spots, resident_worst_of,
-    worst_of,
+    ResidentLv, ResidentWorstOf, arch, device_name, ensure_available, lv_terminal_spots,
+    resident_lv, resident_worst_of, worst_of,
 };
 
 /// The GPU backend is only present in a `gpu` build.
@@ -473,5 +618,81 @@ mod tests {
             device_name().unwrap(),
             arch().unwrap()
         );
+    }
+
+    /// A spot-bump sweep reuses the resident normals/rows/axes: each scenario must be
+    /// bit-identical to a fresh per-call `lv_terminal_spots`.
+    #[test]
+    fn resident_lv_multi_scenario_matches_per_call() {
+        use crate::build_local_vol;
+        use crate::fixture::load_termsheet1_fixture;
+        use std::path::PathBuf;
+
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/fixture/termsheet1.json");
+        let req = load_termsheet1_fixture(path).unwrap().request;
+        let lv = build_local_vol(&req).unwrap().unwrap();
+        let steps = req.trade.steps;
+        let maturity = req.trade.maturity_years;
+        let dt = (maturity / steps as f64) as f32;
+        let rate = req.market.risk_free_rate as f32;
+        let call_barrier = req.trade.knock_out_barrier.unwrap_or(f64::INFINITY) as f32;
+        let gx = lv[0].log_strike_axis().len();
+        let mut rows = vec![0.0f32; 2 * steps * gx];
+        let mut ls_axis = Vec::with_capacity(2 * gx);
+        for f in 0..2 {
+            for s in 0..steps {
+                let row = lv[f].row(s as f64 * dt as f64);
+                for j in 0..gx {
+                    rows[(f * steps + s) * gx + j] = row[j] as f32;
+                }
+            }
+            ls_axis.extend(lv[f].log_strike_axis().iter().map(|&x| x as f32));
+        }
+        let paths = 2048usize;
+        let mut seed = 0x9E37_79B9u32;
+        let mut normals = vec![0.0f32; paths * steps * 2];
+        for value in normals.iter_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *value = ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0;
+        }
+        let divs = [
+            req.market.dividend_yields[0] as f32,
+            req.market.dividend_yields[1] as f32,
+        ];
+        let base = [req.market.spots[0] as f32, req.market.spots[1] as f32];
+        let refs = [
+            req.trade.initial_spots[0] as f32,
+            req.trade.initial_spots[1] as f32,
+        ];
+
+        let mut resident = resident_lv(&normals, &rows, &ls_axis, paths, steps, dt).unwrap();
+        for bump in [1.0f32, 1.005, 0.99] {
+            let s0 = [base[0] * bump, base[1] * bump];
+            resident.run(&s0, refs, call_barrier, rate, divs).unwrap();
+            let (resident_terminal, resident_ko) = resident.download().unwrap();
+            let (terminal, ko) = lv_terminal_spots(
+                &normals,
+                &rows,
+                &ls_axis,
+                &s0,
+                &refs,
+                call_barrier,
+                paths,
+                steps,
+                dt,
+                rate,
+                &divs,
+            )
+            .unwrap();
+            for i in 0..terminal.len() {
+                assert_eq!(
+                    resident_terminal[i].to_bits(),
+                    terminal[i].to_bits(),
+                    "terminal {i} at bump {bump}"
+                );
+            }
+            assert_eq!(resident_ko, ko, "KO periods at bump {bump}");
+        }
     }
 }

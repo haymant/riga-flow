@@ -43,6 +43,12 @@ pub trait Transition: Send + Sync {
     fn inputs(&self) -> &[String];
     fn output(&self) -> &str;
     fn execute(&self, inputs: &[&PlaceValue]) -> Result<PlaceValue, RigaError>;
+
+    /// The population that actually "fired" this transition (e.g. paths that knocked out),
+    /// as opposed to the output shape length. `None` falls back to the output length.
+    fn fired_count(&self, _inputs: &[&PlaceValue], _output: &PlaceValue) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -135,17 +141,22 @@ impl ExecutionGraph {
                 inputs.push(value);
             }
             let output_value = transition.execute(&inputs)?;
-            let output_count = output_value.len();
+            // Firing population, not shape retention: a gate that leaves the shape unchanged
+            // still reports how many tokens actually fired.
+            let fired = transition
+                .fired_count(&inputs, &output_value)
+                .map(|c| c as usize)
+                .unwrap_or_else(|| output_value.len());
             places.insert(transition.output().to_owned(), output_value);
             produced.insert(transition.output().to_owned());
             stats.push(TransitionStats {
                 transition_id: transition.id().to_owned(),
                 input_count: input_count as u64,
-                output_count: output_count as u64,
+                output_count: fired as u64,
                 probability: if input_count == 0 {
                     0.0
                 } else {
-                    output_count as f64 / input_count as f64
+                    fired as f64 / input_count as f64
                 },
                 mean_payoff: 0.0,
                 variance_payoff: 0.0,
@@ -157,7 +168,7 @@ impl ExecutionGraph {
                     sequence: sequence as u64,
                     transition_id: transition.id().to_owned(),
                     input_count: input_count as u64,
-                    output_count: output_count as u64,
+                    output_count: fired as u64,
                 });
             }
         }
