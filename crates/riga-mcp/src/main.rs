@@ -1561,19 +1561,18 @@ fn execution_net_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value,
 }
 
 fn risk_net_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
-    let result = price_put_leg(&fx.request).map_err(ToolError::from_engine)?;
     let report =
         riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
             .map_err(ToolError::from_engine)?;
-    let transitions: Vec<Value> = result
-        .ledger
+    let transitions: Vec<Value> = report
+        .transitions
         .iter()
-        .map(|e| {
+        .map(|t| {
             json!({
-                "id": e.transition_id,
-                "pv_impact": e.pv_impact,
-                "delta_impact": e.delta_impact,
-                "vega_impact": e.vega_impact,
+                "id": t.id,
+                "pv_impact": t.pv_impact,
+                "delta_impact": t.delta_impact,
+                "vega_impact": t.vega_impact,
             })
         })
         .collect();
@@ -2039,6 +2038,31 @@ mod tests {
 
     /// The live request the UI composes must price identically to the on-disk
     /// fixture for every deterministic tool — the tile-sync contract.
+    /// Per-transition Delta/Vega is attributed from the CRN bump scenarios, not
+    /// left at the engine's ledger default of zero.
+    #[test]
+    fn risk_net_attributes_per_transition_delta_and_vega() {
+        let fixture = load_fixture(&reduced_fixture_path()).expect("fixture loads");
+        let value = risk_net_json(&fixture).expect("risk net");
+        let transitions = value["transitions"].as_array().expect("transitions");
+        assert!(!transitions.is_empty(), "no transitions");
+
+        let put = transitions
+            .iter()
+            .find(|t| t["id"] == "final_fixing_eki")
+            .expect("put transition present");
+        assert!(
+            put["vega_impact"].as_f64().expect("vega f64").abs() > 0.0,
+            "down-and-in put vega impact is zero: {put}"
+        );
+        assert!(
+            transitions
+                .iter()
+                .any(|t| t["delta_impact"].as_f64().expect("delta f64").abs() > 0.0),
+            "no transition carries spot delta: {value}"
+        );
+    }
+
     #[test]
     fn inline_request_matches_fixture_for_deterministic_tools() {
         let path = reduced_fixture_path();

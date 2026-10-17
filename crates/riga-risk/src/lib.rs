@@ -476,6 +476,23 @@ pub struct BatchAssetGreeks {
     pub vega_mc_error: f64,
 }
 
+/// Signed risk attributed to one execution transition (ledger id).
+///
+/// Delta/Vega are obtained by differencing the transition's PV impact across the
+/// CRN spot/vol bump pairs already priced for the per-asset Greeks — no extra
+/// engine runs, and the paired differences share the seed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransitionRisk {
+    /// Ledger transition id, e.g. `final_fixing_eki`.
+    pub id: String,
+    /// Base-case PV impact of the transition (from the base ledger).
+    pub pv_impact: f64,
+    /// `Σ_assets (impact_up − impact_down) / (2·h_spot)`, PV per spot-currency unit.
+    pub delta_impact: f64,
+    /// `Σ_assets (impact_up − impact_down) / (2·h_vol)`, PV per 1.00 absolute vol.
+    pub vega_impact: f64,
+}
+
 /// The full central-FD scenario batch for one trade: base + every bumped valuation.
 ///
 /// `scenario_count` is the number of engine valuations in the batch
@@ -487,6 +504,8 @@ pub struct BatchRiskReport {
     pub scenario_count: usize,
     pub seed: u64,
     pub assets: Vec<BatchAssetGreeks>,
+    /// Per-transition PV impact with attributed Delta/Vega.
+    pub transitions: Vec<TransitionRisk>,
     pub rate_up_pv: f64,
     pub rate_down_pv: f64,
     pub correlation_up_pv: f64,
@@ -494,6 +513,44 @@ pub struct BatchRiskReport {
     pub rate_bump: f64,
     pub correlation_bump: f64,
     pub pv_mc_error: f64,
+}
+
+/// Attribute per-transition Delta/Vega from the already-priced CRN scenarios.
+fn transition_risk(greeks: &RiskReport) -> Vec<TransitionRisk> {
+    let impact_of = |ledger: &[riga_core::LedgerEntry], id: &str| -> f64 {
+        ledger
+            .iter()
+            .find(|entry| entry.transition_id == id)
+            .map(|entry| entry.pv_impact)
+            .unwrap_or(0.0)
+    };
+    greeks
+        .base_price
+        .ledger
+        .iter()
+        .map(|entry| {
+            let mut delta_impact = 0.0;
+            let mut vega_impact = 0.0;
+            for asset in &greeks.assets {
+                if asset.spot_bump > 0.0 {
+                    let up = impact_of(&asset.spot_scenarios.up.ledger, &entry.transition_id);
+                    let down = impact_of(&asset.spot_scenarios.down.ledger, &entry.transition_id);
+                    delta_impact += (up - down) / (2.0 * asset.spot_bump);
+                }
+                if asset.volatility_bump > 0.0 {
+                    let up = impact_of(&asset.volatility_scenarios.up.ledger, &entry.transition_id);
+                    let down = impact_of(&asset.volatility_scenarios.down.ledger, &entry.transition_id);
+                    vega_impact += (up - down) / (2.0 * asset.volatility_bump);
+                }
+            }
+            TransitionRisk {
+                id: entry.transition_id.clone(),
+                pv_impact: entry.pv_impact,
+                delta_impact,
+                vega_impact,
+            }
+        })
+        .collect()
 }
 
 impl BatchRiskReport {
@@ -557,6 +614,7 @@ pub fn price_risk_batch(
         scenario_count: 1 + 4 * n + 4,
         seed,
         assets,
+        transitions: transition_risk(&greeks),
         rate_up_pv: rate(hr)?,
         rate_down_pv: rate(-hr)?,
         correlation_up_pv: correlation(hc)?,
