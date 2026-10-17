@@ -63,6 +63,9 @@ struct PricePutParams {
     /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -71,6 +74,9 @@ struct ReplayPathParams {
     /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
     /// Zero-based path id to reconstruct.
     path_id: usize,
 }
@@ -81,6 +87,9 @@ struct PathCubeParams {
     /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
     /// Fraction in [0, 1]; e.g. 0.05 selects the worst 5% of paths.
     percentile: f64,
     /// Maximum number of sample paths returned.
@@ -98,6 +107,9 @@ struct RiskBatchParams {
     /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -106,6 +118,9 @@ struct GetPathParams {
     /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
     /// Zero-based path id.
     path_id: usize,
 }
@@ -115,6 +130,9 @@ struct GetPathParams {
 struct PnlExplainParams {
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
     /// Absolute spot moves per asset.
     #[serde(default)]
     spot_moves: Vec<f64>,
@@ -134,6 +152,9 @@ struct PnlExplainParams {
 struct BookParams {
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
     /// Per-trade notional. Empty ⇒ a single unit trade.
     #[serde(default)]
     notionals: Vec<f64>,
@@ -144,6 +165,9 @@ struct BookParams {
 struct CorpusParams {
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
     /// Baseline name. Defaults to "default".
     #[serde(default)]
     name: Option<String>,
@@ -154,6 +178,9 @@ struct CorpusParams {
 struct TapeParams {
     #[serde(default)]
     fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
     /// Number of leading paths to emit events for.
     #[serde(default = "default_tape_size")]
     max_paths: usize,
@@ -194,11 +221,10 @@ impl RigaMcp {
         description = "Load the canonical termsheet1 fixture and price it through riga_engine::price_put_leg. Unpinned source-market fields produce blocked_pending_market_capture, never a threshold pass."
     )]
     fn price_put(&self, Parameters(params): Parameters<PricePutParams>) -> CallToolResult {
-        let fixture_path = params
-            .fixture_path
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.default_fixture_path.clone());
-        match price_fixture_value(&fixture_path) {
+        match self
+            .resolve_fixture(&params.request, &params.fixture_path)
+            .and_then(|fixture| price_loaded_fixture_value(&fixture))
+        {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -211,8 +237,10 @@ impl RigaMcp {
         &self,
         Parameters(params): Parameters<PricePutParams>,
     ) -> CallToolResult {
-        let path = self.resolve(&params.fixture_path);
-        match load_and_price(&path) {
+        match self
+            .resolve_fixture(&params.request, &params.fixture_path)
+            .and_then(|fx| price_loaded(&fx))
+        {
             Ok((fixture, result)) => structured_success(json!({
                 "legs": result.legs,
                 "ledger": result.ledger,
@@ -229,8 +257,7 @@ impl RigaMcp {
         description = "Reconstruct a single simulated path from its identity (path_id, seed) alone (AC-X5/AC-X6)."
     )]
     fn replay_path(&self, Parameters(params): Parameters<ReplayPathParams>) -> CallToolResult {
-        let path = self.resolve(&params.fixture_path);
-        match load_fixture(&path).and_then(|fixture| {
+        match self.resolve_fixture(&params.request, &params.fixture_path).and_then(|fixture| {
             explain::reconstruct_path(&fixture.request, params.path_id)
                 .map_err(ToolError::from_engine)
         }) {
@@ -246,8 +273,7 @@ impl RigaMcp {
         description = "PathCube query: the worst `percentile` of simulated paths by final worst-of performance."
     )]
     fn query_path_cube(&self, Parameters(params): Parameters<PathCubeParams>) -> CallToolResult {
-        let path = self.resolve(&params.fixture_path);
-        match load_fixture(&path).and_then(|fixture| {
+        match self.resolve_fixture(&params.request, &params.fixture_path).and_then(|fixture| {
             explain::query_worst_percentile(&fixture.request, params.percentile, params.max_sample)
                 .map_err(ToolError::from_engine)
         }) {
@@ -263,8 +289,7 @@ impl RigaMcp {
         description = "Compatibility spelling for query_path_cube: return the worst `percentile` of simulated paths by final worst-of performance."
     )]
     fn query_pathcube(&self, Parameters(params): Parameters<PathCubeParams>) -> CallToolResult {
-        let path = self.resolve(&params.fixture_path);
-        match load_fixture(&path).and_then(|fixture| {
+        match self.resolve_fixture(&params.request, &params.fixture_path).and_then(|fixture| {
             explain::query_worst_percentile(&fixture.request, params.percentile, params.max_sample)
                 .map_err(ToolError::from_engine)
         }) {
@@ -280,8 +305,7 @@ impl RigaMcp {
         description = "Central-FD risk batch (spot/vol/rate/correlation) with CRN for the fixture, plus DV01 and correlation sensitivity."
     )]
     fn risk_batch(&self, Parameters(params): Parameters<RiskBatchParams>) -> CallToolResult {
-        let path = self.resolve(&params.fixture_path);
-        match load_fixture(&path).and_then(|fixture| {
+        match self.resolve_fixture(&params.request, &params.fixture_path).and_then(|fixture| {
             riga_risk::price_risk_batch(
                 &fixture.request,
                 &riga_risk::CentralDifferenceConfig::default(),
@@ -295,8 +319,7 @@ impl RigaMcp {
 
     #[tool(description = "List available market snapshots (id + as_of).")]
     fn list_markets(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).map(|fx| market_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).map(|fx| market_json(&fx)) {
             Ok(value) => structured_success(json!({"markets": [value]})),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -306,8 +329,7 @@ impl RigaMcp {
         description = "Return the market snapshot detail (market_snapshot_id, spots, curves, vols, correlation, model)."
     )]
     fn get_market(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).map(|fx| market_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).map(|fx| market_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -317,8 +339,7 @@ impl RigaMcp {
         description = "Generate a correlated Brownian PathCube block (Z -> Y = L Z) and report its shape/checksum + transition stats."
     )]
     fn generate_paths(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| generate_paths_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| generate_paths_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -328,8 +349,7 @@ impl RigaMcp {
         description = "Return one path's state reconstructed from its identity (path_id, seed)."
     )]
     fn get_path(&self, Parameters(p): Parameters<GetPathParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
             explain::reconstruct_path(&fx.request, p.path_id).map_err(ToolError::from_engine)
         }) {
             Ok(record) => structured_success(serde_json::to_value(record).unwrap_or(Value::Null)),
@@ -339,8 +359,7 @@ impl RigaMcp {
 
     #[tool(description = "Branch statistics: TransitionStats[] with real populations.")]
     fn get_branch_stats(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
             price_put_leg(&fx.request)
                 .map(|r| json!(r.stats))
                 .map_err(ToolError::from_engine)
@@ -354,8 +373,7 @@ impl RigaMcp {
         description = "Payoff distributions: worst-of deciles, KI rate, mean put, from the simulated paths."
     )]
     fn get_distributions(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| distributions_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| distributions_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -363,8 +381,7 @@ impl RigaMcp {
 
     #[tool(description = "Monte Carlo diagnostics: PV standard error and per-transition variance.")]
     fn get_mc_diagnostics(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
             price_put_leg(&fx.request)
                 .map(|r| {
                     json!({
@@ -383,8 +400,7 @@ impl RigaMcp {
 
     #[tool(description = "Per-path cashflow summary (mean funding/coupon/put) plus sample paths.")]
     fn build_cashflows(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| cashflows_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| cashflows_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -394,8 +410,7 @@ impl RigaMcp {
         description = "Execution event tape: a bounded per-path stream (KO / knock-in / maturity) for inspection."
     )]
     fn execution_events(&self, Parameters(p): Parameters<TapeParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| events_json(&fx, p.max_paths)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| events_json(&fx, p.max_paths)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -405,13 +420,13 @@ impl RigaMcp {
     fn compute_risk(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
         self.risk_batch(Parameters(RiskBatchParams {
             fixture_path: p.fixture_path,
+            request: p.request,
         }))
     }
 
     #[tool(description = "Book-level risk: aggregate PV/Greeks across a notional list.")]
     fn compute_book_risk(&self, Parameters(p): Parameters<BookParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| book_risk_json(&fx, &p.notionals)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| book_risk_json(&fx, &p.notionals)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -421,8 +436,7 @@ impl RigaMcp {
         description = "Book-level PV: price a composition once and scale across a notional list."
     )]
     fn price_book(&self, Parameters(p): Parameters<BookParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| book_price_json(&fx, &p.notionals)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| book_price_json(&fx, &p.notionals)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -432,8 +446,7 @@ impl RigaMcp {
         description = "Async book risk (SEP-2663): when the client supports tasks this call returns a task handle with progress/cancellation; otherwise it is computed inline."
     )]
     fn price_book_async(&self, Parameters(p): Parameters<BookParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| book_risk_json(&fx, &p.notionals)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| book_risk_json(&fx, &p.notionals)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -443,8 +456,7 @@ impl RigaMcp {
         description = "P&L explain: contributions from spot/vol/rate/correlation moves via the risk batch."
     )]
     fn pl_explain(&self, Parameters(p): Parameters<PnlExplainParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
             pl_explain_json(&fx, &p.spot_moves, &p.vol_moves, p.rate_move, p.corr_move)
         }) {
             Ok(value) => structured_success(value),
@@ -454,8 +466,7 @@ impl RigaMcp {
 
     #[tool(description = "Return the Explain Ledger (LedgerEntry[]) for the trade.")]
     fn get_ledger(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
             price_put_leg(&fx.request)
                 .map(|r| json!({"ledger": r.ledger, "determinism": r.determinism}))
                 .map_err(ToolError::from_engine)
@@ -469,8 +480,7 @@ impl RigaMcp {
         description = "Execution Petri net: places/transitions/token counts derived from the ledger and stats."
     )]
     fn query_execution_net(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| execution_net_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| execution_net_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -480,8 +490,7 @@ impl RigaMcp {
         description = "Risk propagation net: signed risk contribution per transition and per asset."
     )]
     fn query_risk_net(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| risk_net_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| risk_net_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -489,8 +498,7 @@ impl RigaMcp {
 
     #[tool(description = "Economic-intuition sanity checks on the Greeks.")]
     fn validate_greeks(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| validate_greeks_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| validate_greeks_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -498,8 +506,7 @@ impl RigaMcp {
 
     #[tool(description = "Stress-band recommendations around the KI and KO barriers.")]
     fn recommend_scenarios(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).map(|fx| recommendations_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).map(|fx| recommendations_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -509,8 +516,7 @@ impl RigaMcp {
         description = "Root-cause analysis record grounded in the ledger and determinism envelope."
     )]
     fn root_cause(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| rca_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| rca_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -523,8 +529,7 @@ impl RigaMcp {
         &self,
         Parameters(p): Parameters<PricePutParams>,
     ) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| governance_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| governance_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -533,8 +538,7 @@ impl RigaMcp {
     #[tool(description = "Capture a PV/Greeks baseline under a name for regression comparison.")]
     fn freeze_baseline(&self, Parameters(p): Parameters<CorpusParams>) -> CallToolResult {
         let name = p.name.unwrap_or_else(|| "default".into());
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
             let report =
                 riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
                     .map_err(ToolError::from_engine)?;
@@ -561,8 +565,7 @@ impl RigaMcp {
     )]
     fn compare_corpus(&self, Parameters(p): Parameters<CorpusParams>) -> CallToolResult {
         let name = p.name.unwrap_or_else(|| "default".into());
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| compare_corpus_json(&fx, &name)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| compare_corpus_json(&fx, &name)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -571,8 +574,7 @@ impl RigaMcp {
     #[tool(description = "Regression triage: exceptions from compare_corpus grouped by measure.")]
     fn triage_regression(&self, Parameters(p): Parameters<CorpusParams>) -> CallToolResult {
         let name = p.name.unwrap_or_else(|| "default".into());
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path)
+        match self.resolve_fixture(&p.request, &p.fixture_path)
             .and_then(|fx| compare_corpus_json(&fx, &name))
             .map(|c| {
                 let exceptions = c["exceptions"].clone();
@@ -598,8 +600,7 @@ impl RigaMcp {
         description = "Base-vs-current valuation explain: reprice under spot/vol/rate/correlation moves and decompose the PV change (Taylor) with a residual."
     )]
     fn valuation_explain(&self, Parameters(p): Parameters<PnlExplainParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
             valuation_explain_json(&fx, &p.spot_moves, &p.vol_moves, p.rate_move, p.corr_move)
         }) {
             Ok(value) => structured_success(value),
@@ -611,8 +612,7 @@ impl RigaMcp {
         description = "Bump scenarios (base + central up/down per factor) for scenario comparison; fills the atlas Scenario Comparison view."
     )]
     fn scenario(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        let path = self.resolve(&p.fixture_path);
-        match load_fixture(&path).and_then(|fx| scenario_json(&fx)) {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| scenario_json(&fx)) {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
@@ -855,10 +855,25 @@ impl ServerHandler for RigaMcp {
                 .map(|info| info.capabilities.supports_tasks())
                 .unwrap_or(false);
             if supports_tasks {
-                let fixture_path = self.default_fixture_path.clone();
+                let book = match request.arguments.as_ref().and_then(|args| args.get("request")) {
+                    Some(value) => {
+                        serde_json::from_value::<riga_engine::PriceRequest>(value.clone())
+                            .map(riga_engine::fixture::LoadedFixture::from_request)
+                            .map_err(|error| {
+                                ErrorData::invalid_params(
+                                    format!(
+                                        "request must match riga_engine::PriceRequest: {error}"
+                                    ),
+                                    None,
+                                )
+                            })?
+                    }
+                    None => load_fixture(&self.default_fixture_path)
+                        .map_err(|error| ErrorData::internal_error(error.message, None))?,
+                };
                 let notionals = parse_notionals(request.arguments.as_ref());
                 let task = self.tasks.spawn(TaskOptions::new(), move |ctx| {
-                    Box::pin(run_book_task(fixture_path, notionals, ctx))
+                    Box::pin(run_book_task(book, notionals, ctx))
                 });
                 return Ok(CallToolResponse::Task(CreateTaskResult::new(task)));
             }
@@ -996,6 +1011,27 @@ impl RigaMcp {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_fixture_path.clone())
     }
+
+    /// Resolve the fixture a tool prices: an inline `request` when the caller
+    /// supplies one (the UI's live composed request), else the on-disk fixture
+    /// (explicit `fixture_path`, else the default `docs/fixture/termsheet1.json`).
+    fn resolve_fixture(
+        &self,
+        request: &Option<Value>,
+        fixture_path: &Option<String>,
+    ) -> Result<riga_engine::fixture::LoadedFixture, ToolError> {
+        if let Some(value) = request {
+            let request: riga_engine::PriceRequest =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    ToolError::new(
+                        "invalid_price_request",
+                        format!("request must match riga_engine::PriceRequest: {error}"),
+                    )
+                })?;
+            return Ok(riga_engine::fixture::LoadedFixture::from_request(request));
+        }
+        load_fixture(&self.resolve(fixture_path))
+    }
 }
 
 fn load_fixture(path: &Path) -> Result<riga_engine::fixture::LoadedFixture, ToolError> {
@@ -1008,6 +1044,14 @@ fn load_and_price(
     let fixture = load_fixture(path)?;
     let result = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
     Ok((fixture, result))
+}
+
+/// `load_and_price` for an already-resolved fixture (inline request or on-disk).
+fn price_loaded(
+    fixture: &riga_engine::fixture::LoadedFixture,
+) -> Result<(riga_engine::fixture::LoadedFixture, riga_core::PriceResult), ToolError> {
+    let result = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
+    Ok((fixture.clone(), result))
 }
 
 fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
@@ -1075,8 +1119,16 @@ fn price_trade_value(request_value: Value) -> Result<Value, ToolError> {
         .map_err(|error| ToolError::new("serialization_error", error.to_string()))
 }
 
+#[cfg(test)]
 fn price_fixture_value(path: &Path) -> Result<Value, ToolError> {
     let fixture = load_termsheet1_fixture(path).map_err(ToolError::from_engine)?;
+    price_loaded_fixture_value(&fixture)
+}
+
+/// Price a resolved fixture (inline request or on-disk) and attach the acceptance block.
+fn price_loaded_fixture_value(
+    fixture: &riga_engine::fixture::LoadedFixture,
+) -> Result<Value, ToolError> {
     let result = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
     let result = serde_json::to_value(result)
         .map_err(|error| ToolError::new("serialization_error", error.to_string()))?;
@@ -1776,14 +1828,12 @@ fn parse_notionals(arguments: Option<&serde_json::Map<String, Value>>) -> Vec<f6
 /// Body of the async `price_book_async` task: prices the book with progress messages and
 /// cooperative cancellation (SEP-2663).
 async fn run_book_task(
-    fixture_path: PathBuf,
+    fixture: riga_engine::fixture::LoadedFixture,
     notionals: Vec<f64>,
     ctx: TaskContext,
 ) -> Result<CallToolResult, rmcp::task_manager::TaskExit> {
     use rmcp::task_manager::TaskExit;
     ctx.set_status_message("book: pricing");
-    let fixture =
-        load_fixture(&fixture_path).map_err(|e| ErrorData::internal_error(e.message, None))?;
     let report = riga_risk::price_risk_batch(
         &fixture.request,
         &riga_risk::CentralDifferenceConfig::default(),
@@ -1820,7 +1870,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "0b1f4798a89b918f1324664a96444e422df1d309a1fb4382af468e88b4561a1d";
+        "ec6b5b03a04d3ae320fa6aa3d3985454d002f885c4c714ce71473a5039d1f0b9";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -1955,6 +2005,7 @@ mod tests {
         let params = || {
             Parameters(PathCubeParams {
                 fixture_path: Some("/missing/termsheet1.json".into()),
+                request: None,
                 percentile: 0.05,
                 max_sample: 4,
             })
@@ -1970,5 +2021,162 @@ mod tests {
         let cli = parse_cli_args(Vec::<String>::new()).expect("default CLI parses");
         assert_eq!(cli.transport, Transport::Stdio);
         assert_eq!(cli.allowed_hosts, vec!["localhost", "127.0.0.1", "::1"]);
+    }
+
+    /// A copy of `termsheet1` with a tiny path count, so the equivalence and
+    /// override tests run in seconds rather than minutes. Both sides use the same
+    /// reduced request, so the comparison stays exact.
+    fn reduced_fixture_path() -> std::path::PathBuf {
+        let source = std::fs::read_to_string(default_fixture_path()).expect("fixture readable");
+        let mut value: Value = serde_json::from_str(&source).expect("fixture parses");
+        value["run"]["paths"] = json!(800);
+        value["run"]["path_block_size"] = json!(256);
+        let path =
+            std::env::temp_dir().join(format!("riga-mcp-reduced-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&value).expect("serialise")).expect("write");
+        path
+    }
+
+    /// The live request the UI composes must price identically to the on-disk
+    /// fixture for every deterministic tool — the tile-sync contract.
+    #[test]
+    fn inline_request_matches_fixture_for_deterministic_tools() {
+        let path = reduced_fixture_path();
+        let path_str = path.to_string_lossy().into_owned();
+        let server = RigaMcp::new(path.clone());
+        let fixture = load_fixture(&path).expect("fixture loads");
+        let request = serde_json::to_value(&fixture.request).expect("request serialises");
+
+        macro_rules! same {
+            ($($method:ident),+ $(,)?) => {{
+                $(
+                    let disk = server.$method(Parameters(PricePutParams {
+                        fixture_path: Some(path_str.clone()),
+                        request: None,
+                    }));
+                    let inline = server.$method(Parameters(PricePutParams {
+                        fixture_path: None,
+                        request: Some(request.clone()),
+                    }));
+                    assert!(
+                        !inline.is_error.unwrap_or(false),
+                        "{} errored inline: {:?}",
+                        stringify!($method),
+                        inline.structured_content
+                    );
+                    assert_eq!(disk.is_error, inline.is_error, "{} error flag", stringify!($method));
+                    assert_eq!(
+                        disk.structured_content,
+                        inline.structured_content,
+                        "{}: inline request must match the on-disk fixture",
+                        stringify!($method)
+                    );
+                )+
+            }};
+        }
+
+        same!(
+            get_ledger,
+            get_branch_stats,
+            get_distributions,
+            get_mc_diagnostics,
+            build_cashflows,
+            query_execution_net,
+            query_risk_net,
+            validate_greeks,
+            scenario,
+            generate_paths,
+            recommend_scenarios,
+        );
+
+        // Parameterised tools carry the same `request` field.
+        let disk_rb = server.risk_batch(Parameters(RiskBatchParams {
+            fixture_path: Some(path_str.clone()),
+            request: None,
+        }));
+        let inline_rb = server.risk_batch(Parameters(RiskBatchParams {
+            fixture_path: None,
+            request: Some(request.clone()),
+        }));
+        assert_eq!(disk_rb.structured_content, inline_rb.structured_content, "risk_batch");
+
+        let moves = || (vec![0.01, -0.01], vec![0.01, -0.01], 0.0001, 0.01);
+        let (sm, vm, rm, cm) = moves();
+        let disk_pl = server.pl_explain(Parameters(PnlExplainParams {
+            fixture_path: Some(path_str.clone()),
+            request: None,
+            spot_moves: sm,
+            vol_moves: vm,
+            rate_move: rm,
+            corr_move: cm,
+        }));
+        let (sm, vm, rm, cm) = moves();
+        let inline_pl = server.pl_explain(Parameters(PnlExplainParams {
+            fixture_path: None,
+            request: Some(request.clone()),
+            spot_moves: sm,
+            vol_moves: vm,
+            rate_move: rm,
+            corr_move: cm,
+        }));
+        assert_eq!(disk_pl.structured_content, inline_pl.structured_content, "pl_explain");
+
+        // `CorpusParams` tools carry the same `request` field.
+        let disk_cc = server.compare_corpus(Parameters(CorpusParams {
+            fixture_path: Some(path_str.clone()),
+            request: None,
+            name: None,
+        }));
+        let inline_cc = server.compare_corpus(Parameters(CorpusParams {
+            fixture_path: None,
+            request: Some(request.clone()),
+            name: None,
+        }));
+        assert_eq!(disk_cc.structured_content, inline_cc.structured_content, "compare_corpus");
+    }
+
+    /// An inline request must *override* the on-disk fixture, not be ignored.
+    #[test]
+    fn inline_request_overrides_the_on_disk_fixture() {
+        let path = reduced_fixture_path();
+        let path_str = path.to_string_lossy().into_owned();
+        let server = RigaMcp::new(path.clone());
+        let fixture = load_fixture(&path).expect("fixture loads");
+        let base = serde_json::to_value(&fixture.request).expect("request serialises");
+        let mut halved = base.clone();
+        let strike = halved["trade"]["strike"].as_f64().expect("strike");
+        halved["trade"]["strike"] = json!(strike * 0.5);
+
+        let put_of = |result: &CallToolResult| -> f64 {
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/result/legs/down_and_in_put"))
+                .and_then(Value::as_f64)
+                .expect("put leg present")
+        };
+
+        let from_disk = server.price_put(Parameters(PricePutParams {
+            fixture_path: Some(path_str),
+            request: None,
+        }));
+        let from_base = server.price_put(Parameters(PricePutParams {
+            fixture_path: None,
+            request: Some(base),
+        }));
+        let from_halved = server.price_put(Parameters(PricePutParams {
+            fixture_path: None,
+            request: Some(halved),
+        }));
+        assert!(!from_base.is_error.unwrap_or(false) && !from_halved.is_error.unwrap_or(false));
+        assert_eq!(
+            put_of(&from_disk),
+            put_of(&from_base),
+            "an unmodified inline request must equal the on-disk fixture"
+        );
+        assert!(
+            put_of(&from_halved) < put_of(&from_disk),
+            "a halved strike must lower the down-and-in put — the inline request was ignored"
+        );
     }
 }

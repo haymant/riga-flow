@@ -16,6 +16,32 @@ pub struct LoadedFixture {
     pub engine_model: String,
 }
 
+impl LoadedFixture {
+    /// Wrap an inline [`PriceRequest`] with no on-disk fixture. The tool surface
+    /// accepts the live request from the UI so every tile prices the same trade;
+    /// such requests carry no acceptance block, so `expected` is `Default` and
+    /// `market_is_pinned` is false (acceptance is never evaluated).
+    pub fn from_request(request: PriceRequest) -> Self {
+        let engine_model = if request.local_vol.is_some() {
+            "dupire_local_vol_inline".to_owned()
+        } else {
+            "gbm_flat_atm_proxy_from_initial_fixings".to_owned()
+        };
+        Self {
+            name: request.trade.trade_id.clone(),
+            request,
+            expected: FixtureExpected::default(),
+            market_provenance: "inline request".to_owned(),
+            market_is_pinned: false,
+            market_quality_note:
+                "Inline request: no on-disk fixture, so no acceptance block is evaluated."
+                    .to_owned(),
+            source_model: "inline".to_owned(),
+            engine_model,
+        }
+    }
+}
+
 fn number(value: &Value, path: &str) -> Result<f64, RigaError> {
     value.pointer(path).and_then(Value::as_f64).ok_or_else(|| {
         RigaError::new(

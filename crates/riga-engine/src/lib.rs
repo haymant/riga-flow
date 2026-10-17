@@ -55,7 +55,7 @@ pub struct Fixture {
     pub expected: FixtureExpected,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct FixtureExpected {
     pub put_pv: f64,
     pub relative_tolerance: f64,
