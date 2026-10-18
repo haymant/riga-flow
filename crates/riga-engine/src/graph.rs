@@ -57,7 +57,32 @@ pub struct ExecutionGraph {
     transitions: Vec<Box<dyn Transition>>,
 }
 
+/// A read-only summary of one transition's wiring (id + inputs + output).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitionSummary {
+    pub id: String,
+    pub inputs: Vec<String>,
+    pub output: String,
+}
+
 impl ExecutionGraph {
+    /// Read-only transition wiring (id + inputs + output), for adapters.
+    pub fn transition_summaries(&self) -> Vec<TransitionSummary> {
+        self.transitions
+            .iter()
+            .map(|transition| TransitionSummary {
+                id: transition.id().to_owned(),
+                inputs: transition.inputs().to_vec(),
+                output: transition.output().to_owned(),
+            })
+            .collect()
+    }
+
+    /// Source place names (the graph's inputs).
+    pub fn source_names(&self) -> Vec<String> {
+        self.source_places.keys().cloned().collect()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

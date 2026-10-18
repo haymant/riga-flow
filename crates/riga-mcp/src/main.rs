@@ -451,6 +451,19 @@ impl RigaMcp {
         }
     }
 
+    #[tool(
+        description = "The product payoff graph (worst-of → range accrual → global KO → knock-in → down-and-in put → aggregate legs → memory coupon → aggregate coupon) as nodes/edges. The execution net (query_execution_net) is its priced projection."
+    )]
+    fn payoff_graph(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        match self
+            .resolve_fixture(&p.request, &p.fixture_path)
+            .and_then(|fx| payoff_graph_json(&fx))
+        {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
     #[tool(description = "List available market snapshots (id + as_of).")]
     fn list_markets(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
         match self.resolve_fixture(&p.request, &p.fixture_path).map(|fx| market_json(&fx)) {            Ok(value) => structured_success(json!({"markets": [value]})),
@@ -1620,6 +1633,51 @@ fn path_series_json(
     }))
 }
 
+/// The product payoff graph (worst-of → range accrual → global KO → knock-in →
+/// down-and-in put → aggregate legs → memory coupon → aggregate coupon), as
+/// nodes/edges. Read-only: it builds the payoff `ExecutionGraph`, never the
+/// pricing hot loop.
+fn payoff_graph_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let request = &fx.request;
+    let spec = riga_engine::payoff::PayoffSpec {
+        paths: request.config.paths.clamp(1, 64),
+        times: request.trade.steps.clamp(2, 64),
+        strike: request.trade.strike,
+        knock_in_barrier: request.trade.knock_in_barrier,
+        knock_out_barrier: request.trade.knock_out_barrier.unwrap_or(f64::INFINITY),
+        coupon_barrier: request.trade.coupon_barrier.unwrap_or(0.0),
+        coupon_rate: request.trade.coupon_rate.unwrap_or(0.0),
+        discount: 1.0,
+    };
+    let graph = riga_engine::payoff::build_put_graph(spec);
+    let summaries = graph.transition_summaries();
+    let nodes: Vec<Value> = summaries
+        .iter()
+        .map(|transition| {
+            json!({
+                "id": transition.id,
+                "inputs": transition.inputs,
+                "output": transition.output,
+            })
+        })
+        .collect();
+    let edges: Vec<Value> = summaries
+        .iter()
+        .flat_map(|transition| {
+            transition
+                .inputs
+                .iter()
+                .map(move |input| json!({ "source": input, "target": transition.id }))
+        })
+        .collect();
+    Ok(json!({
+        "sources": graph.source_names(),
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": summaries.len(),
+    }))
+}
+
 fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
     json!({
         "base_pv": report.base_pv,
@@ -2123,6 +2181,7 @@ fn execution_net_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value,
         "transitions": transitions,
         "stats": result.stats,
         "run_id": result.determinism.market_snapshot_id,
+        "payoff_graph": payoff_graph_json(fx)?,
     }))
 }
 
@@ -2435,7 +2494,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "4bdc4a61e466322ab8ab08cd03ef68580f2476d08eac3f8087b335a8a7e990da";
+        "184b4b203fc189121bdb1fac7975ed6a726c4cecc2d3c7c8370f3b3e07267abd";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -2470,6 +2529,7 @@ mod tests {
             "mc_convergence",
             "pl_explain",
             "path_series",
+            "payoff_graph",
             "price_book",
             "price_book_async",
             "price_put",
@@ -2819,6 +2879,34 @@ mod tests {
             .expect("value");
         assert_eq!(off_value["detailed"].as_bool().unwrap(), false);
         assert!(off_value["final_band"].is_object());
+    }
+
+    /// `payoff_graph` is the full product graph, and `query_execution_net`
+    /// carries it — the execution net is the priced projection of it.
+    #[test]
+    fn payoff_graph_is_the_superset_of_the_execution_net() {
+        let path = reduced_fixture_path();
+        let server = RigaMcp::new(path.clone());
+        let response = server.payoff_graph(Parameters(PricePutParams {
+            fixture_path: Some(path.to_string_lossy().into_owned()),
+            request: None,
+        }));
+        assert!(!response.is_error.unwrap_or(false), "{:?}", response.structured_content);
+        let value = response.structured_content.expect("value");
+        let nodes = value["nodes"].as_array().expect("nodes").clone();
+        assert!(nodes.len() >= 8, "full payoff graph has >=8 transitions, got {}", nodes.len());
+        assert_eq!(value["node_count"].as_u64().unwrap() as usize, nodes.len());
+        assert!(!value["edges"].as_array().unwrap().is_empty());
+
+        let net = server.query_execution_net(Parameters(PricePutParams {
+            fixture_path: None,
+            request: None,
+        }));
+        let net_value = net.structured_content.expect("net");
+        assert!(
+            net_value["payoff_graph"]["nodes"].as_array().unwrap().len() >= 8,
+            "query_execution_net must carry the payoff graph"
+        );
     }
 
     #[test]
