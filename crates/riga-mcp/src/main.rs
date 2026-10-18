@@ -105,6 +105,17 @@ struct RiskDetailedParams {
     request: Option<Value>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TradeDesignParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReplayPathParams {
@@ -393,6 +404,19 @@ impl RigaMcp {
         match self
             .resolve_fixture(&p.request, &p.fixture_path)
             .and_then(|fx| risk_detailed_json(&fx))
+        {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Trade-design batch: reprice with each trade parameter bumped (strike, KI/KO barrier, coupon barrier/rate) under CRN, and return per-parameter PV/KI/KO and per-leg deltas. At TraceLevel::Off only the PV delta is returned."
+    )]
+    fn trade_design(&self, Parameters(p): Parameters<TradeDesignParams>) -> CallToolResult {
+        match self
+            .resolve_fixture(&p.request, &p.fixture_path)
+            .and_then(|fx| trade_design_json(&fx))
         {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
@@ -1345,6 +1369,119 @@ fn risk_detailed_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value,
     }))
 }
 
+/// One trade-design point: PV, KI/KO probabilities and the per-leg PVs.
+struct DesignPoint {
+    pv: f64,
+    ki: f64,
+    ko: f64,
+    coupon_pv: f64,
+    memory_pv: f64,
+    put_pv: f64,
+    funding: f64,
+}
+
+fn design_point(request: &PriceRequest) -> Result<DesignPoint, ToolError> {
+    let result = price_put_leg(request).map_err(ToolError::from_engine)?;
+    let ko = result
+        .ledger
+        .iter()
+        .find(|entry| entry.transition_id == "daily_global_ko")
+        .map(|entry| {
+            if entry.population_before > 0 {
+                entry.population_after as f64 / entry.population_before as f64
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+    Ok(DesignPoint {
+        pv: result.pv,
+        ki: result.ki_probability,
+        ko,
+        coupon_pv: result.legs.coupon,
+        memory_pv: result.legs.memory_coupon,
+        put_pv: result.legs.down_and_in_put,
+        funding: result.legs.funding,
+    })
+}
+
+fn design_value(point: &DesignPoint, base: &DesignPoint, step: f64, detailed: bool) -> Value {
+    if detailed {
+        json!({
+            "step": step,
+            "pv": point.pv,
+            "delta_pv": point.pv - base.pv,
+            "ki": point.ki,
+            "delta_ki": point.ki - base.ki,
+            "ko": point.ko,
+            "delta_ko": point.ko - base.ko,
+            "coupon_pv": point.coupon_pv,
+            "put_pv": point.put_pv,
+            "funding": point.funding,
+        })
+    } else {
+        json!({ "step": step, "delta_pv": point.pv - base.pv })
+    }
+}
+
+/// Trade-parameter bump batch (CRN: same seed, one trade field moved). One engine
+/// run per parameter, batched in a single tool call; `TraceLevel::Off` returns the
+/// PV delta only.
+fn trade_design_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let base_request = &fx.request;
+    let base = design_point(base_request)?;
+    let detailed = !matches!(base_request.config.trace_level, TraceLevel::Off);
+    const STEP: f64 = 0.01;
+
+    let params: Vec<(&str, fn(&mut riga_core::PhoenixTrade))> = vec![
+        ("strike", |trade| trade.strike += STEP),
+        ("knock_in_barrier", |trade| trade.knock_in_barrier += STEP),
+        ("knock_out_barrier", |trade| {
+            if let Some(value) = trade.knock_out_barrier.as_mut() {
+                *value += STEP;
+            }
+        }),
+        ("coupon_barrier", |trade| {
+            if let Some(value) = trade.coupon_barrier.as_mut() {
+                *value += STEP;
+            }
+        }),
+        ("coupon_rate", |trade| {
+            if let Some(value) = trade.coupon_rate.as_mut() {
+                *value += STEP;
+            }
+        }),
+    ];
+
+    let mut parameters: Vec<Value> = Vec::with_capacity(params.len());
+    for (name, apply) in params {
+        let mut request = base_request.clone();
+        apply(&mut request.trade);
+        let point = design_point(&request)?;
+        let mut value = design_value(&point, &base, STEP, detailed);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("parameter".to_owned(), json!(name));
+        }
+        parameters.push(value);
+    }
+
+    Ok(json!({
+        "base": {
+            "pv": base.pv,
+            "ki": base.ki,
+            "ko": base.ko,
+            "coupon_pv": base.coupon_pv,
+            "memory_pv": base.memory_pv,
+            "put_pv": base.put_pv,
+            "funding": base.funding,
+        },
+        "step": STEP,
+        "detailed": detailed,
+        "scenario_count": 1 + parameters.len(),
+        "parameters": parameters,
+    }))
+}
+
 fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
     json!({
         "base_pv": report.base_pv,
@@ -2160,7 +2297,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "f68f437b547727429a7ff584f5d0bf425cf19ee2c2f2552bb373fd6bfc72f011";
+        "01aa88a9441c74427ba63c8bba76a4ebbac506c124773795fe4b167d87772899";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -2208,6 +2345,7 @@ mod tests {
             "risk_batch",
             "root_cause",
             "scenario",
+            "trade_design",
             "triage_regression",
             "validate_greeks",
             "valuation_explain",
@@ -2462,6 +2600,48 @@ mod tests {
         assert_eq!(cross.len(), 2);
         assert_eq!(cross[0][1].as_f64().unwrap(), cross[1][0].as_f64().unwrap());
         assert_eq!(value["bucket_vegas"].as_array().unwrap().len(), 2);
+    }
+
+    /// `trade_design` bumps each trade parameter under CRN, and returns the PV
+    /// delta only at `TraceLevel::Off`.
+    #[test]
+    fn trade_design_bumps_each_parameter_under_crn() {
+        let path = reduced_fixture_path();
+        let server = RigaMcp::new(path.clone());
+        let response = server.trade_design(Parameters(TradeDesignParams {
+            fixture_path: Some(path.to_string_lossy().into_owned()),
+            request: None,
+        }));
+        assert!(!response.is_error.unwrap_or(false), "{:?}", response.structured_content);
+        let value = response.structured_content.expect("value");
+        assert!(value["base"]["pv"].as_f64().unwrap().is_finite());
+        let params = value["parameters"].as_array().expect("parameters").clone();
+        assert_eq!(params.len(), 5, "five trade parameters");
+        for parameter in &params {
+            assert!(parameter["delta_pv"].as_f64().unwrap().is_finite(), "{parameter}");
+        }
+        let strike = params.iter().find(|p| p["parameter"] == "strike").expect("strike");
+        assert_ne!(strike["delta_pv"].as_f64().unwrap(), 0.0, "a strike bump must move the PV");
+
+        let mut off =
+            serde_json::to_value(&load_fixture(&path).expect("fixture").request).expect("json");
+        off["config"]["trace_level"] = json!("off");
+        let off_value = server
+            .trade_design(Parameters(TradeDesignParams {
+                fixture_path: None,
+                request: Some(off),
+            }))
+            .structured_content
+            .expect("value");
+        assert_eq!(off_value["detailed"].as_bool().unwrap(), false);
+        assert_eq!(
+            off_value["parameters"].as_array().unwrap()[0]
+                .as_object()
+                .unwrap()
+                .len(),
+            3,
+            "trace off must return parameter/step/delta_pv only"
+        );
     }
 
     #[test]
