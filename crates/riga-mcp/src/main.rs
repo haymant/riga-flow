@@ -1,5 +1,6 @@
 use riga_core::TraceLevel;
 use riga_engine::fixture::load_termsheet1_fixture;
+use riga_engine::pathcube::{gbm_evolve, generate_correlated_block};
 use riga_engine::{PriceRequest, explain, price_put_leg};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
@@ -114,6 +115,20 @@ struct TradeDesignParams {
     /// Optional inline PriceRequest. When present it overrides `fixture_path`.
     #[serde(default)]
     request: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PathSeriesParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
+    /// Path index for the selected-path series (default 0).
+    #[serde(default)]
+    path_id: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -417,6 +432,19 @@ impl RigaMcp {
         match self
             .resolve_fixture(&p.request, &p.fixture_path)
             .and_then(|fx| trade_design_json(&fx))
+        {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Bounded-path GBM diagnostics: worst-of series for one path, population quantile bands (P05/P25/P50/P75/P95) per step, barrier-crossing counts and state occupancy. Capped at 1024 paths / 512 steps (a separate read-only path, never the pricing hot loop); TraceLevel::Off returns the final band only."
+    )]
+    fn path_series(&self, Parameters(p): Parameters<PathSeriesParams>) -> CallToolResult {
+        match self
+            .resolve_fixture(&p.request, &p.fixture_path)
+            .and_then(|fx| path_series_json(&fx, p.path_id.unwrap_or(0)))
         {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
@@ -1482,6 +1510,116 @@ fn trade_design_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, 
     }))
 }
 
+/// Bounded GBM path-cube diagnostics: the selected path's worst-of series, the
+/// population quantile bands per step, barrier-crossing counts and state
+/// occupancy. Uses a *bounded* path/time budget and a fresh cube — a separate,
+/// read-only path that never touches the pricing hot loop.
+fn path_series_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    path_id: usize,
+) -> Result<Value, ToolError> {
+    const PATH_CAP: usize = 1024;
+    const TIME_CAP: usize = 512;
+
+    let base = &fx.request;
+    let detailed = !matches!(base.config.trace_level, TraceLevel::Off);
+    let paths = base.config.paths.clamp(1, PATH_CAP);
+    let steps = base.trade.steps.clamp(2, TIME_CAP);
+    let factors = base.market.spots.len();
+    let dt = base.trade.maturity_years / (steps - 1) as f64;
+
+    let correlation =
+        riga_engine::riga_market::CorrelationMatrix::from_rows(&base.market.correlation)
+            .map_err(|message| ToolError::new("correlation_invalid", message))?;
+    let chol = correlation
+        .cholesky()
+        .map_err(|message| ToolError::new("correlation_invalid", message))?;
+    let block = generate_correlated_block(base.config.seed, paths, steps, &chol);
+    let cube = gbm_evolve(
+        &base.market.spots,
+        &base.market.vols,
+        base.market.risk_free_rate,
+        &base.market.dividend_yields,
+        dt,
+        &block,
+    )
+    .map_err(ToolError::from_engine)?;
+
+    let initial: Vec<f32> = base.market.spots.iter().map(|spot| *spot as f32).collect();
+    let worst_of = |path: usize, time: usize| -> f64 {
+        (0..factors)
+            .map(|factor| (cube.get(path, time, factor) / initial[factor]) as f64)
+            .fold(f64::INFINITY, f64::min)
+    };
+
+    let mut bands = Vec::with_capacity(steps);
+    let mut crossings = Vec::with_capacity(steps);
+    let mut states = Vec::with_capacity(steps);
+    for time in 0..steps {
+        let mut values: Vec<f64> = (0..paths).map(|path| worst_of(path, time)).collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let quantile = |q: f64| -> f64 {
+            let index = (q * (values.len() as f64 - 1.0)).round() as usize;
+            values[index.min(values.len() - 1)]
+        };
+        let knock_in = values.iter().filter(|value| **value <= base.trade.knock_in_barrier).count();
+        let knock_out = base
+            .trade
+            .knock_out_barrier
+            .map(|level| values.iter().filter(|value| **value >= level).count());
+        let above_coupon = base
+            .trade
+            .coupon_barrier
+            .map(|level| values.iter().filter(|value| **value >= level).count())
+            .unwrap_or(0);
+        let years = dt * time as f64;
+        bands.push(json!({
+            "time": time, "years": years,
+            "p05": quantile(0.05), "p25": quantile(0.25), "p50": quantile(0.5),
+            "p75": quantile(0.75), "p95": quantile(0.95),
+        }));
+        crossings.push(json!({
+            "time": time, "years": years, "knock_in": knock_in, "knock_out": knock_out,
+        }));
+        states.push(json!({
+            "time": time, "years": years,
+            "below_ki": knock_in,
+            "above_ki": paths - knock_in,
+            "coupon_paid": above_coupon,
+        }));
+    }
+
+    if !detailed {
+        return Ok(json!({
+            "paths": paths, "steps": steps, "detailed": false,
+            "final_band": bands.last().cloned().unwrap_or(Value::Null),
+        }));
+    }
+
+    let selected = path_id.min(paths - 1);
+    let series: Vec<Value> = (0..steps)
+        .map(|time| {
+            json!({ "time": time, "years": dt * time as f64, "worst_of": worst_of(selected, time) })
+        })
+        .collect();
+
+    Ok(json!({
+        "paths": paths,
+        "steps": steps,
+        "detailed": true,
+        "selected_path": selected,
+        "barriers": {
+            "knock_in": base.trade.knock_in_barrier,
+            "knock_out": base.trade.knock_out_barrier,
+            "coupon": base.trade.coupon_barrier,
+        },
+        "series": series,
+        "bands": bands,
+        "crossings": crossings,
+        "states": states,
+    }))
+}
+
 fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
     json!({
         "base_pv": report.base_pv,
@@ -2297,7 +2435,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "01aa88a9441c74427ba63c8bba76a4ebbac506c124773795fe4b167d87772899";
+        "4bdc4a61e466322ab8ab08cd03ef68580f2476d08eac3f8087b335a8a7e990da";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -2331,6 +2469,7 @@ mod tests {
             "list_markets",
             "mc_convergence",
             "pl_explain",
+            "path_series",
             "price_book",
             "price_book_async",
             "price_put",
@@ -2642,6 +2781,44 @@ mod tests {
             3,
             "trace off must return parameter/step/delta_pv only"
         );
+    }
+
+    /// `path_series` returns a bounded cube series + bands + states, and only the
+    /// final band at `TraceLevel::Off`.
+    #[test]
+    fn path_series_returns_bounded_series_bands_and_states() {
+        let path = reduced_fixture_path();
+        let server = RigaMcp::new(path.clone());
+        let response = server.path_series(Parameters(PathSeriesParams {
+            fixture_path: Some(path.to_string_lossy().into_owned()),
+            request: None,
+            path_id: Some(3),
+        }));
+        assert!(!response.is_error.unwrap_or(false), "{:?}", response.structured_content);
+        let value = response.structured_content.expect("value");
+        assert_eq!(value["selected_path"].as_u64().unwrap(), 3);
+        assert!(value["paths"].as_u64().unwrap() <= 1024, "bounded path budget");
+        let bands = value["bands"].as_array().expect("bands").clone();
+        let series = value["series"].as_array().expect("series").clone();
+        assert_eq!(bands.len(), series.len(), "one band and one series point per step");
+        let last = &bands[bands.len() - 1];
+        assert!(last["p05"].as_f64().unwrap() <= last["p95"].as_f64().unwrap());
+        assert_eq!(value["states"].as_array().unwrap().len(), series.len());
+        assert_eq!(value["crossings"].as_array().unwrap().len(), series.len());
+
+        let mut off =
+            serde_json::to_value(&load_fixture(&path).expect("fixture").request).expect("json");
+        off["config"]["trace_level"] = json!("off");
+        let off_value = server
+            .path_series(Parameters(PathSeriesParams {
+                fixture_path: None,
+                request: Some(off),
+                path_id: None,
+            }))
+            .structured_content
+            .expect("value");
+        assert_eq!(off_value["detailed"].as_bool().unwrap(), false);
+        assert!(off_value["final_band"].is_object());
     }
 
     #[test]
