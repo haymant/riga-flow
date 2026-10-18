@@ -1,3 +1,4 @@
+use riga_core::TraceLevel;
 use riga_engine::fixture::load_termsheet1_fixture;
 use riga_engine::{PriceRequest, explain, price_put_leg};
 use rmcp::{
@@ -66,6 +67,20 @@ struct PricePutParams {
     /// Optional inline PriceRequest. When present it overrides `fixture_path`.
     #[serde(default)]
     request: Option<Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct McConvergenceParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
+    /// Optional explicit ascending path-count ladder; empty ⇒ a scale-relative default.
+    #[serde(default)]
+    ladder: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -313,6 +328,25 @@ impl RigaMcp {
             .map_err(ToolError::from_engine)
         }) {
             Ok(report) => structured_success(risk_batch_json(&report)),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Monte-Carlo convergence: PV / standard error / 95% CI / KI / KO probability vs path count. One call; the ladder is scale-relative to the configured path count. At TraceLevel::Off only the final point is returned."
+    )]
+    fn mc_convergence(&self, Parameters(p): Parameters<McConvergenceParams>) -> CallToolResult {
+        match self.resolve_fixture(&p.request, &p.fixture_path).and_then(|fx| {
+            let ladder = if p.ladder.is_empty() {
+                convergence_ladder(fx.request.config.paths)
+            } else {
+                let mut explicit = p.ladder.clone();
+                explicit.sort_unstable();
+                explicit
+            };
+            mc_convergence_json(&fx, &ladder)
+        }) {
+            Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
         }
     }
@@ -1052,6 +1086,70 @@ fn price_loaded(
 ) -> Result<(riga_engine::fixture::LoadedFixture, riga_core::PriceResult), ToolError> {
     let result = price_put_leg(&fixture.request).map_err(ToolError::from_engine)?;
     Ok((fixture.clone(), result))
+}
+
+/// Path-count ladder for `mc_convergence`: scale-relative to the configured path
+/// count so the series is cheap at any scale and the last point is the full run.
+fn convergence_ladder(max_paths: usize) -> Vec<usize> {
+    let max = max_paths.max(1);
+    let mut ladder: Vec<usize> = [32usize, 16, 8, 4, 2]
+        .iter()
+        .map(|divisor| (max / divisor).max(1))
+        .collect();
+    ladder.push(max);
+    ladder.sort_unstable();
+    ladder.dedup();
+    ladder
+}
+
+/// PV / SE / CI / KI / KO convergence series. One engine run per ladder point
+/// (batched inside a single tool call); the seed is unchanged, so the points are
+/// CRN-paired. `TraceLevel::Off` returns only the final point.
+fn mc_convergence_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+    ladder: &[usize],
+) -> Result<Value, ToolError> {
+    let last = ladder.last().copied().unwrap_or(fx.request.config.paths);
+    let ladder: Vec<usize> = if matches!(fx.request.config.trace_level, TraceLevel::Off) {
+        vec![last]
+    } else {
+        ladder.to_vec()
+    };
+    let mut points: Vec<Value> = Vec::with_capacity(ladder.len());
+    for paths in ladder {
+        let mut request = fx.request.clone();
+        request.config.paths = paths;
+        let result = price_put_leg(&request).map_err(ToolError::from_engine)?;
+        let ko = result
+            .ledger
+            .iter()
+            .find(|entry| entry.transition_id == "daily_global_ko")
+            .map(|entry| {
+                if entry.population_before > 0 {
+                    entry.population_after as f64 / entry.population_before as f64
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        let se = result.mc_error;
+        points.push(json!({
+            "paths": paths,
+            "pv": result.pv,
+            "se": se,
+            "relative_se": if result.pv.abs() > 0.0 { se / result.pv.abs() } else { 0.0 },
+            "lower": result.pv - 1.96 * se,
+            "upper": result.pv + 1.96 * se,
+            "ki": result.ki_probability,
+            "ko": ko,
+        }));
+    }
+    let final_point = points.last().cloned().unwrap_or(Value::Null);
+    Ok(json!({
+        "points": points,
+        "final": final_point,
+        "trace_level": format!("{:?}", fx.request.config.trace_level),
+    }))
 }
 
 fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
@@ -1869,7 +1967,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "ec6b5b03a04d3ae320fa6aa3d3985454d002f885c4c714ce71473a5039d1f0b9";
+        "a537986a58e069637de87d264ce47f0d9bc0ea0adaa457d7ff7339d525f82fc1";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -1900,6 +1998,7 @@ mod tests {
             "get_path",
             "health",
             "list_markets",
+            "mc_convergence",
             "pl_explain",
             "price_book",
             "price_book_async",
@@ -2060,6 +2159,52 @@ mod tests {
                 .iter()
                 .any(|t| t["delta_impact"].as_f64().expect("delta f64").abs() > 0.0),
             "no transition carries spot delta: {value}"
+        );
+    }
+
+    /// `mc_convergence` returns one batched ladder series with CRN-paired points,
+    /// and only the final point at `TraceLevel::Off`.
+    #[test]
+    fn mc_convergence_returns_a_paired_ladder_series() {
+        let path = reduced_fixture_path();
+        let path_str = path.to_string_lossy().into_owned();
+        let server = RigaMcp::new(path.clone());
+
+        let full = server.mc_convergence(Parameters(McConvergenceParams {
+            fixture_path: Some(path_str),
+            request: None,
+            ladder: Vec::new(),
+        }));
+        assert!(!full.is_error.unwrap_or(false), "{:?}", full.structured_content);
+        let value = full.structured_content.expect("structured content");
+        let points = value["points"].as_array().expect("points").clone();
+        assert!(points.len() >= 2, "expected a ladder, got {}", points.len());
+
+        let paths: Vec<u64> = points.iter().map(|p| p["paths"].as_u64().expect("paths")).collect();
+        assert!(paths.windows(2).all(|w| w[0] < w[1]), "ladder must ascend: {paths:?}");
+        assert_eq!(*paths.last().unwrap(), 800, "final point is the configured path count");
+
+        for point in &points {
+            assert!(point["pv"].as_f64().expect("pv").is_finite());
+            assert!(point["upper"].as_f64().unwrap() >= point["lower"].as_f64().unwrap());
+            assert!((0.0..=1.0).contains(&point["ki"].as_f64().expect("ki")));
+            assert!((0.0..=1.0).contains(&point["ko"].as_f64().expect("ko")));
+        }
+
+        // TraceLevel::Off => aggregate only (the final point).
+        let mut off_request =
+            serde_json::to_value(&load_fixture(&path).expect("fixture").request).expect("json");
+        off_request["config"]["trace_level"] = json!("off");
+        let off = server.mc_convergence(Parameters(McConvergenceParams {
+            fixture_path: None,
+            request: Some(off_request),
+            ladder: Vec::new(),
+        }));
+        let off_value = off.structured_content.expect("structured content");
+        assert_eq!(
+            off_value["points"].as_array().expect("points").len(),
+            1,
+            "trace off must return only the final point"
         );
     }
 
