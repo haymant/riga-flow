@@ -83,6 +83,17 @@ struct McConvergenceParams {
     ladder: Vec<usize>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DistributionsParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReplayPathParams {
@@ -351,10 +362,22 @@ impl RigaMcp {
         }
     }
 
+    #[tool(
+        description = "Distribution histograms and percentiles for the priced trade: per metric (pv, put_payoff, coupon_pv, funding, worst_final) mean/median/std/p05/p50/p95/min/max plus equal-width bins. At TraceLevel::Off only the aggregate statistics are returned."
+    )]
+    fn distributions_histogram(&self, Parameters(p): Parameters<DistributionsParams>) -> CallToolResult {
+        match self
+            .resolve_fixture(&p.request, &p.fixture_path)
+            .and_then(|fx| distributions_histogram_json(&fx))
+        {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
     #[tool(description = "List available market snapshots (id + as_of).")]
     fn list_markets(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
-        match self.resolve_fixture(&p.request, &p.fixture_path).map(|fx| market_json(&fx)) {
-            Ok(value) => structured_success(json!({"markets": [value]})),
+        match self.resolve_fixture(&p.request, &p.fixture_path).map(|fx| market_json(&fx)) {            Ok(value) => structured_success(json!({"markets": [value]})),
             Err(error) => structured_error(error.code, error.message),
         }
     }
@@ -1149,6 +1172,81 @@ fn mc_convergence_json(
         "points": points,
         "final": final_point,
         "trace_level": format!("{:?}", fx.request.config.trace_level),
+    }))
+}
+
+/// Summary statistics + equal-width histogram for one metric sample.
+fn metric_stats(name: &str, mut values: Vec<f64>, bin_count: usize, include_bins: bool) -> Value {
+    let n = values.len();
+    if n == 0 {
+        return json!({ "metric": name, "count": 0 });
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let quantile = |q: f64| -> f64 {
+        let index = (q * (n as f64 - 1.0)).round() as usize;
+        values[index.min(n - 1)]
+    };
+    let min = values[0];
+    let max = values[n - 1];
+    let bins: Vec<Value> = if include_bins && bin_count > 0 {
+        let width = if (max - min).abs() > 0.0 {
+            (max - min) / bin_count as f64
+        } else {
+            1.0
+        };
+        let mut counts = vec![0usize; bin_count];
+        for value in &values {
+            let index = (((value - min) / width).floor() as isize).clamp(0, bin_count as isize - 1) as usize;
+            counts[index] += 1;
+        }
+        (0..bin_count)
+            .map(|i| {
+                let lo = min + width * i as f64;
+                json!({ "lo": lo, "hi": lo + width, "count": counts[i] })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    json!({
+        "metric": name,
+        "count": n,
+        "mean": mean,
+        "median": quantile(0.5),
+        "std_dev": variance.sqrt(),
+        "p05": quantile(0.05),
+        "p50": quantile(0.5),
+        "p95": quantile(0.95),
+        "min": min,
+        "max": max,
+        "bins": bins,
+    })
+}
+
+/// Per-metric distributions from one path corpus run. `TraceLevel::Off` returns
+/// the aggregate statistics without the (large) histogram bins.
+fn distributions_histogram_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+) -> Result<Value, ToolError> {
+    let records = explain::run_paths(&fx.request).map_err(ToolError::from_engine)?;
+    let include_bins = !matches!(fx.request.config.trace_level, TraceLevel::Off);
+    const BIN_COUNT: usize = 20;
+    let metrics: Vec<Value> = [
+        ("pv", records.iter().map(|r| r.pv).collect::<Vec<_>>()),
+        ("put_payoff", records.iter().map(|r| r.put_payoff).collect::<Vec<_>>()),
+        ("coupon_pv", records.iter().map(|r| r.coupon_pv).collect::<Vec<_>>()),
+        ("funding", records.iter().map(|r| r.funding).collect::<Vec<_>>()),
+        ("worst_final", records.iter().map(|r| r.worst_final).collect::<Vec<_>>()),
+    ]
+    .into_iter()
+    .map(|(name, values)| metric_stats(name, values, BIN_COUNT, include_bins))
+    .collect();
+    Ok(json!({
+        "count": records.len(),
+        "bin_count": if include_bins { BIN_COUNT } else { 0 },
+        "metrics": metrics,
     }))
 }
 
@@ -1967,7 +2065,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "a537986a58e069637de87d264ce47f0d9bc0ea0adaa457d7ff7339d525f82fc1";
+        "fbd6e3343e0f1be148dac9f3d7f17440d8ccc565866ece795d4b5298d5316d92";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -1984,6 +2082,7 @@ mod tests {
             "compare_corpus",
             "compute_book_risk",
             "compute_risk",
+            "distributions_histogram",
             "estimate_aad_greeks",
             "execution_events",
             "explain_pv_attribution",
@@ -2206,6 +2305,46 @@ mod tests {
             1,
             "trace off must return only the final point"
         );
+    }
+
+    /// `distributions_histogram` returns per-metric statistics + bins, and drops
+    /// the bins at `TraceLevel::Off` (aggregate only).
+    #[test]
+    fn distributions_histogram_returns_bins_and_percentiles() {
+        let path = reduced_fixture_path();
+        let path_str = path.to_string_lossy().into_owned();
+        let server = RigaMcp::new(path.clone());
+
+        let full = server.distributions_histogram(Parameters(DistributionsParams {
+            fixture_path: Some(path_str),
+            request: None,
+        }));
+        assert!(!full.is_error.unwrap_or(false), "{:?}", full.structured_content);
+        let value = full.structured_content.expect("value");
+        let metrics = value["metrics"].as_array().expect("metrics").clone();
+        assert!(metrics.len() >= 4, "expected >=4 metrics, got {}", metrics.len());
+        let pv = metrics.iter().find(|m| m["metric"] == "pv").expect("pv metric");
+        assert!(pv["p05"].as_f64().unwrap() <= pv["p95"].as_f64().unwrap());
+        assert_eq!(pv["bins"].as_array().unwrap().len(), 20);
+
+        let mut off =
+            serde_json::to_value(&load_fixture(&path).expect("fixture").request).expect("json");
+        off["config"]["trace_level"] = json!("off");
+        let off_value = server
+            .distributions_histogram(Parameters(DistributionsParams {
+                fixture_path: None,
+                request: Some(off),
+            }))
+            .structured_content
+            .expect("value");
+        let off_pv = off_value["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["metric"] == "pv")
+            .unwrap()
+            .clone();
+        assert!(off_pv["bins"].as_array().unwrap().is_empty(), "trace off must drop bins");
     }
 
     #[test]
