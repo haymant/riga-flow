@@ -94,6 +94,17 @@ struct DistributionsParams {
     request: Option<Value>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RiskDetailedParams {
+    /// Optional source fixture path. Omit this to use docs/fixture/termsheet1.json.
+    #[serde(default)]
+    fixture_path: Option<String>,
+    /// Optional inline PriceRequest. When present it overrides `fixture_path`.
+    #[serde(default)]
+    request: Option<Value>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReplayPathParams {
@@ -369,6 +380,19 @@ impl RigaMcp {
         match self
             .resolve_fixture(&p.request, &p.fixture_path)
             .and_then(|fx| distributions_histogram_json(&fx))
+        {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
+    #[tool(
+        description = "Detailed risk for the priced trade: per-asset Δ/Γ/ν, DV01/rho, correlation sensitivity, one-day theta, cross-gamma over the factor pair, and per-factor vega buckets. (riga has no FX factor, so fx_delta is 0.)"
+    )]
+    fn risk_detailed(&self, Parameters(p): Parameters<RiskDetailedParams>) -> CallToolResult {
+        match self
+            .resolve_fixture(&p.request, &p.fixture_path)
+            .and_then(|fx| risk_detailed_json(&fx))
         {
             Ok(value) => structured_success(value),
             Err(error) => structured_error(error.code, error.message),
@@ -1250,6 +1274,77 @@ fn distributions_histogram_json(
     }))
 }
 
+fn risk_detailed_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, ToolError> {
+    let report =
+        riga_risk::price_risk_batch(&fx.request, &riga_risk::CentralDifferenceConfig::default())
+            .map_err(ToolError::from_engine)?;
+    let base = &fx.request;
+
+    // Theta: PV change over one calendar day (maturity shrinks by 1/365).
+    let mut decayed = base.clone();
+    decayed.trade.maturity_years = (base.trade.maturity_years - 1.0 / 365.0).max(1.0 / 365.0);
+    let theta = price_put_leg(&decayed).map_err(ToolError::from_engine)?.pv - report.base_pv;
+
+    // Cross-gamma over each factor pair, via a 4-point relative-spot stencil.
+    let factor_count = base.market.spots.len();
+    let half: Vec<f64> = base.market.spots.iter().map(|spot| spot * 0.01).collect();
+    let price_with = |deltas: &[f64]| -> Result<f64, ToolError> {
+        let mut request = base.clone();
+        for (index, delta) in deltas.iter().enumerate() {
+            if let Some(spot) = request.market.spots.get_mut(index) {
+                *spot += delta;
+            }
+        }
+        Ok(price_put_leg(&request).map_err(ToolError::from_engine)?.pv)
+    };
+    let mut cross_gamma = vec![vec![0.0_f64; factor_count]; factor_count];
+    for i in 0..factor_count {
+        for j in (i + 1)..factor_count {
+            let stencil = |di: f64, dj: f64| {
+                let mut deltas = vec![0.0; factor_count];
+                deltas[i] = di * half[i];
+                deltas[j] = dj * half[j];
+                price_with(&deltas)
+            };
+            let value = (stencil(1.0, 1.0)? - stencil(1.0, -1.0)? - stencil(-1.0, 1.0)?
+                + stencil(-1.0, -1.0)?)
+                / (4.0 * half[i] * half[j]);
+            cross_gamma[i][j] = value;
+            cross_gamma[j][i] = value;
+        }
+    }
+
+    let assets: Vec<Value> = report
+        .assets
+        .iter()
+        .map(|asset| {
+            json!({
+                "asset_index": asset.asset_index,
+                "delta": asset.delta,
+                "gamma": asset.gamma,
+                "vega": asset.vega,
+            })
+        })
+        .collect();
+    let bucket_vegas: Vec<Value> = report
+        .assets
+        .iter()
+        .map(|asset| json!({ "bucket": format!("#{}", asset.asset_index), "vega": asset.vega }))
+        .collect();
+
+    Ok(json!({
+        "base_pv": report.base_pv,
+        "assets": assets,
+        "dv01": report.dv01(),
+        "rho": report.dv01(),
+        "correlation_sensitivity": report.correlation_sensitivity(),
+        "theta": theta,
+        "fx_delta": 0.0,
+        "cross_gamma": cross_gamma,
+        "bucket_vegas": bucket_vegas,
+    }))
+}
+
 fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
     json!({
         "base_pv": report.base_pv,
@@ -2065,7 +2160,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "fbd6e3343e0f1be148dac9f3d7f17440d8ccc565866ece795d4b5298d5316d92";
+        "f68f437b547727429a7ff584f5d0bf425cf19ee2c2f2552bb373fd6bfc72f011";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -2108,6 +2203,7 @@ mod tests {
             "query_pathcube",
             "query_risk_net",
             "recommend_scenarios",
+            "risk_detailed",
             "replay_path",
             "risk_batch",
             "root_cause",
@@ -2345,6 +2441,27 @@ mod tests {
             .unwrap()
             .clone();
         assert!(off_pv["bins"].as_array().unwrap().is_empty(), "trace off must drop bins");
+    }
+
+    /// `risk_detailed` returns theta, rho, cross-gamma and vega buckets.
+    #[test]
+    fn risk_detailed_returns_theta_rho_and_cross_gamma() {
+        let path = reduced_fixture_path();
+        let server = RigaMcp::new(path.clone());
+        let response = server.risk_detailed(Parameters(RiskDetailedParams {
+            fixture_path: Some(path.to_string_lossy().into_owned()),
+            request: None,
+        }));
+        assert!(!response.is_error.unwrap_or(false), "{:?}", response.structured_content);
+        let value = response.structured_content.expect("value");
+        assert!(value["base_pv"].as_f64().unwrap().is_finite());
+        assert!(value["theta"].as_f64().unwrap().is_finite());
+        assert_eq!(value["rho"].as_f64().unwrap(), value["dv01"].as_f64().unwrap());
+        assert_eq!(value["fx_delta"].as_f64().unwrap(), 0.0, "no FX factor");
+        let cross = value["cross_gamma"].as_array().unwrap();
+        assert_eq!(cross.len(), 2);
+        assert_eq!(cross[0][1].as_f64().unwrap(), cross[1][0].as_f64().unwrap());
+        assert_eq!(value["bucket_vegas"].as_array().unwrap().len(), 2);
     }
 
     #[test]
