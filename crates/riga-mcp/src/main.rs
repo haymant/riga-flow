@@ -464,6 +464,19 @@ impl RigaMcp {
         }
     }
 
+    #[tool(
+        description = "Percentile convergence: the population P05/P25/P50/P75/P95 of the terminal worst-of across a path-count ladder (bounded cubes; capped at 1024 paths / 512 steps). TraceLevel::Off returns the final point only."
+    )]
+    fn percentile_convergence(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
+        match self
+            .resolve_fixture(&p.request, &p.fixture_path)
+            .and_then(|fx| percentile_convergence_json(&fx))
+        {
+            Ok(value) => structured_success(value),
+            Err(error) => structured_error(error.code, error.message),
+        }
+    }
+
     #[tool(description = "List available market snapshots (id + as_of).")]
     fn list_markets(&self, Parameters(p): Parameters<PricePutParams>) -> CallToolResult {
         match self.resolve_fixture(&p.request, &p.fixture_path).map(|fx| market_json(&fx)) {            Ok(value) => structured_success(json!({"markets": [value]})),
@@ -1678,6 +1691,71 @@ fn payoff_graph_json(fx: &riga_engine::fixture::LoadedFixture) -> Result<Value, 
     }))
 }
 
+/// Population quantile bands of the terminal worst-of across a path-count
+/// ladder. Builds one *bounded* cube per ladder point — a separate, read-only
+/// path (note.rs/simd/gpu/qmc untouched). `TraceLevel::Off` returns the final point.
+fn percentile_convergence_json(
+    fx: &riga_engine::fixture::LoadedFixture,
+) -> Result<Value, ToolError> {
+    const PATH_CAP: usize = 1024;
+    const TIME_CAP: usize = 512;
+
+    let base = &fx.request;
+    let detailed = !matches!(base.config.trace_level, TraceLevel::Off);
+    let paths = base.config.paths.clamp(1, PATH_CAP);
+    let steps = base.trade.steps.clamp(2, TIME_CAP);
+    let factors = base.market.spots.len();
+    let dt = base.trade.maturity_years / (steps - 1) as f64;
+
+    let correlation =
+        riga_engine::riga_market::CorrelationMatrix::from_rows(&base.market.correlation)
+            .map_err(|message| ToolError::new("correlation_invalid", message))?;
+    let chol = correlation
+        .cholesky()
+        .map_err(|message| ToolError::new("correlation_invalid", message))?;
+    let initial: Vec<f32> = base.market.spots.iter().map(|spot| *spot as f32).collect();
+    let ladder = if detailed { convergence_ladder(paths) } else { vec![paths] };
+
+    let mut points: Vec<Value> = Vec::with_capacity(ladder.len());
+    for count in ladder {
+        let block = generate_correlated_block(base.config.seed, count, steps, &chol);
+        let cube = gbm_evolve(
+            &base.market.spots,
+            &base.market.vols,
+            base.market.risk_free_rate,
+            &base.market.dividend_yields,
+            dt,
+            &block,
+        )
+        .map_err(ToolError::from_engine)?;
+        let mut worst: Vec<f64> = (0..count)
+            .map(|path| {
+                (0..factors)
+                    .map(|factor| (cube.get(path, steps - 1, factor) / initial[factor]) as f64)
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+        worst.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let quantile = |q: f64| -> f64 {
+            let index = (q * (worst.len() as f64 - 1.0)).round() as usize;
+            worst[index.min(worst.len() - 1)]
+        };
+        points.push(json!({
+            "paths": count,
+            "p05": quantile(0.05),
+            "p25": quantile(0.25),
+            "p50": quantile(0.50),
+            "p75": quantile(0.75),
+            "p95": quantile(0.95),
+        }));
+    }
+
+    Ok(json!({
+        "detailed": detailed,
+        "points": points,
+    }))
+}
+
 fn risk_batch_json(report: &riga_risk::BatchRiskReport) -> Value {
     json!({
         "base_pv": report.base_pv,
@@ -2494,7 +2572,7 @@ mod tests {
     /// SHA-256 of the frozen tool catalogue (name + description + input schema).
     /// Bump only for an intentional, versioned schema change.
     const TOOL_SCHEMA_SHA256: &str =
-        "184b4b203fc189121bdb1fac7975ed6a726c4cecc2d3c7c8370f3b3e07267abd";
+        "1982164847f740cfdd4af952afb02fc38ae3b53cd1038d87e17251b8f7a0060f";
 
     #[test]
     fn tool_surface_is_frozen() {
@@ -2530,6 +2608,7 @@ mod tests {
             "pl_explain",
             "path_series",
             "payoff_graph",
+            "percentile_convergence",
             "price_book",
             "price_book_async",
             "price_put",
@@ -2907,6 +2986,30 @@ mod tests {
             net_value["payoff_graph"]["nodes"].as_array().unwrap().len() >= 8,
             "query_execution_net must carry the payoff graph"
         );
+    }
+
+    /// `percentile_convergence` returns a bounded ladder of terminal worst-of bands.
+    #[test]
+    fn percentile_convergence_returns_a_ladder_of_bands() {
+        let path = reduced_fixture_path();
+        let server = RigaMcp::new(path.clone());
+        let response = server.percentile_convergence(Parameters(PricePutParams {
+            fixture_path: Some(path.to_string_lossy().into_owned()),
+            request: None,
+        }));
+        assert!(!response.is_error.unwrap_or(false), "{:?}", response.structured_content);
+        let value = response.structured_content.expect("value");
+        let points = value["points"].as_array().expect("points").clone();
+        assert!(points.len() >= 2, "expected a ladder, got {}", points.len());
+        let paths: Vec<u64> = points.iter().map(|p| p["paths"].as_u64().unwrap()).collect();
+        assert!(paths.windows(2).all(|w| w[0] < w[1]), "ladder must ascend: {paths:?}");
+        assert_eq!(*paths.last().unwrap(), 800, "final point is the configured path count");
+        for point in &points {
+            let p05 = point["p05"].as_f64().unwrap();
+            let p50 = point["p50"].as_f64().unwrap();
+            let p95 = point["p95"].as_f64().unwrap();
+            assert!(p05 <= p50 && p50 <= p95, "bands must be ordered: {point}");
+        }
     }
 
     #[test]
