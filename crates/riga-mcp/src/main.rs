@@ -1560,7 +1560,11 @@ fn path_series_json(
     let chol = correlation
         .cholesky()
         .map_err(|message| ToolError::new("correlation_invalid", message))?;
-    let block = generate_correlated_block(base.config.seed, paths, steps, &chol);
+    // `gbm_evolve` writes the value *after* applying `drift + diffusion·z` at each
+    // slice, so its slice 0 is already t = dt — there is no t = 0 slice. Generate
+    // `steps - 1` slices and put the known initial level in front, so the series
+    // spans t = 0 … maturity and `years = dt·time` is honest.
+    let block = generate_correlated_block(base.config.seed, paths, steps - 1, &chol);
     let cube = gbm_evolve(
         &base.market.spots,
         &base.market.vols,
@@ -1573,8 +1577,12 @@ fn path_series_json(
 
     let initial: Vec<f32> = base.market.spots.iter().map(|spot| *spot as f32).collect();
     let worst_of = |path: usize, time: usize| -> f64 {
+        if time == 0 {
+            // Every path sits at its initial spot, so the ratio is exactly 1.
+            return 1.0;
+        }
         (0..factors)
-            .map(|factor| (cube.get(path, time, factor) / initial[factor]) as f64)
+            .map(|factor| (cube.get(path, time - 1, factor) / initial[factor]) as f64)
             .fold(f64::INFINITY, f64::min)
     };
 
@@ -1638,6 +1646,7 @@ fn path_series_json(
             "knock_in": base.trade.knock_in_barrier,
             "knock_out": base.trade.knock_out_barrier,
             "coupon": base.trade.coupon_barrier,
+            "strike": base.trade.strike,
         },
         "series": series,
         "bands": bands,
@@ -2944,6 +2953,31 @@ mod tests {
         assert!(last["p05"].as_f64().unwrap() <= last["p95"].as_f64().unwrap());
         assert_eq!(value["states"].as_array().unwrap().len(), series.len());
         assert_eq!(value["crossings"].as_array().unwrap().len(), series.len());
+
+        // t = 0 is the initial spot for every path, so the band is degenerate at 1
+        // (gbm_evolve's slice 0 is already t = dt, so the helper prepends it).
+        let first = &bands[0];
+        for key in ["p05", "p25", "p50", "p75", "p95"] {
+            assert!(
+                (first[key].as_f64().unwrap() - 1.0).abs() < 1e-12,
+                "step 0 must sit at the initial level: {first}",
+            );
+        }
+        assert_eq!(first["years"].as_f64().unwrap(), 0.0);
+        assert_eq!(first["time"].as_u64().unwrap(), 0);
+        // The series spans t = 0 … maturity, not one dt past it.
+        let maturity_years = load_fixture(&path)
+            .expect("fixture")
+            .request
+            .trade
+            .maturity_years;
+        let last_years = last["years"].as_f64().unwrap();
+        assert!(
+            (last_years - maturity_years).abs() < 1e-9,
+            "last step {last_years} must equal maturity {maturity_years}",
+        );
+        // The strike is reported so the tiles can draw the exercise line.
+        assert!(value["barriers"]["strike"].as_f64().is_some());
 
         let mut off =
             serde_json::to_value(&load_fixture(&path).expect("fixture").request).expect("json");
