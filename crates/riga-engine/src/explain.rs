@@ -28,6 +28,31 @@ pub struct PathIdentity {
     pub sobol_index: u64,
 }
 
+/// One period of a path's coupon strip (Diagram 1: C01 base, C02 barrier
+/// adjustment, C03 memory recovery). Nominal amounts are recorded before
+/// discounting; `pv` is the discounted amount booked in `coupon_by_period`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CouponPeriodRecord {
+    pub period: usize,
+    /// Payment (or period-end) time in years; 0 for periods after termination.
+    pub years: f64,
+    /// Steps in the period where WPS >= the coupon barrier (C02 qualifier).
+    pub qualified_steps: usize,
+    pub period_steps: usize,
+    /// C01/C02 accrual due at this payment (nominal).
+    pub accrual: f64,
+    /// C03 memory recovered with this payment (nominal).
+    pub memory_paid: f64,
+    /// Total coupon paid (nominal) = accrual + memory_paid.
+    pub paid: f64,
+    /// Memory added to the carry when the period paid nothing.
+    pub memory_accrued: f64,
+    pub discount_factor: f64,
+    pub pv: f64,
+    /// True when the payment came from a knock-out rather than a period end.
+    pub knocked_out: bool,
+}
+
 /// The economic state of one simulated path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PathRecord {
@@ -41,6 +66,9 @@ pub struct PathRecord {
     /// Expected coupon PV per remaining period (index = period), for the timeline view.
     #[serde(default)]
     pub coupon_by_period: Vec<f64>,
+    /// Nominal coupon strip per period (Diagram 1), for the coupon-engine view.
+    #[serde(default)]
+    pub coupon_ledger: Vec<CouponPeriodRecord>,
     pub funding: f64,
     pub pv: f64,
 }
@@ -119,6 +147,23 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
             let mut unpaid_memory = 0.0;
             let mut path_coupon_pv = 0.0;
             let mut coupon_by_period = vec![0.0; periods];
+            let mut coupon_ledger: Vec<CouponPeriodRecord> = (0..periods)
+                .map(|period| CouponPeriodRecord {
+                    period,
+                    years: 0.0,
+                    qualified_steps: 0,
+                    period_steps: (steps * (period + 1) / periods)
+                        .saturating_sub(steps * period / periods)
+                        .max(1),
+                    accrual: 0.0,
+                    memory_paid: 0.0,
+                    paid: 0.0,
+                    memory_accrued: 0.0,
+                    discount_factor: 0.0,
+                    pv: 0.0,
+                    knocked_out: false,
+                })
+                .collect();
             let mut path_memory_coupon_pv = 0.0;
             let mut path_received_coupon = false;
             let mut final_worst = 1.0;
@@ -165,6 +210,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                         .saturating_sub(steps * period / periods)
                         .max(1);
                     accrual_this_period += coupon_rate / period_steps as f64;
+                    coupon_ledger[period].qualified_steps += 1;
                 }
 
                 let call_active = step >= call_start_step;
@@ -181,8 +227,15 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                     };
                     let carry_paid = if due > 0.0 { unpaid_memory } else { 0.0 };
                     let coupon_amount = due + carry_paid;
+                    let df = (-rate * time).exp();
+                    coupon_ledger[period].years = time;
+                    coupon_ledger[period].accrual = due;
+                    coupon_ledger[period].memory_paid = carry_paid;
+                    coupon_ledger[period].paid = coupon_amount;
+                    coupon_ledger[period].discount_factor = df;
+                    coupon_ledger[period].pv = coupon_amount * df;
+                    coupon_ledger[period].knocked_out = true;
                     if coupon_amount > 0.0 {
-                        let df = (-rate * time).exp();
                         path_coupon_pv += due * df;
                         path_memory_coupon_pv += carry_paid * df;
                         coupon_by_period[period] += coupon_amount * df;
@@ -203,8 +256,16 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                     } else {
                         accrual_this_period
                     };
+                    let df = (-rate * time).exp();
+                    let row = &mut coupon_ledger[period];
+                    row.years = time;
+                    row.accrual = due;
+                    row.memory_paid = if due > 0.0 { unpaid_memory } else { 0.0 };
+                    row.paid = if due > 0.0 { due + unpaid_memory } else { 0.0 };
+                    row.discount_factor = df;
+                    row.pv = row.paid * df;
+                    row.memory_accrued = if due == 0.0 && request.trade.memory_coupon { coupon_rate } else { 0.0 };
                     if due > 0.0 {
-                        let df = (-rate * time).exp();
                         path_coupon_pv += due * df;
                         path_memory_coupon_pv += unpaid_memory * df;
                         coupon_by_period[period] += (due + unpaid_memory) * df;
@@ -245,6 +306,7 @@ pub fn run_paths(request: &PriceRequest) -> Result<Vec<PathRecord>, RigaError> {
                 put_payoff: put,
                 coupon_pv: coupon_nominal,
                 coupon_by_period,
+                coupon_ledger,
                 funding,
                 pv,
             });
